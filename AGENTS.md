@@ -485,13 +485,62 @@ on hardware; its source and prebuilt binaries are unchanged.
   isolated Python 3.12, exact wheel versions/hashes from `uv.lock`, temporary
   dependencies, read-only repository/root, masked agent/Git/editor files,
   non-root execution, and a disconnected network. No host dependency installs.
-  This revision has no physical vehicle validation or route replay yet.
+  The user subsequently reported approximately 15 minutes of driving with no
+  observed recovery issues. This is positive user feedback, not controlled
+  validation or a route replay. Hard-turn disengagement still occurs as intended;
+  the user deferred any change to that behavior to a future task.
 - Delivery/maintenance: use the same fast-forward `release-mici` publication and
   normal updater as TESLA-003; no reinstall or version bump is required. Preserve
   existing prebuilt artifacts and installer alias. Reconcile CAN timestamp/parser
   changes, the independent planner angle, alignment priority, EPS classification
   latency, and the hard/fault/envelope guards during future upstream integration.
   Reassess the separate CAN subscription if upstream publishes this raw signal.
+
+### INVESTIGATION-001 - Tesla Autopark cancellation (no runtime change)
+
+- Report: Autopark begins but cancels before the vehicle moves; enabling Always
+  Offroad lets it work. User confirmed sunnypilot steering and speed were fully
+  disengaged and Tesla was set to TACC. No CAN capture from the failure was
+  available. Selecting TACC does not establish the comma's alpha-long setting.
+- Strongest explanation: the existing safety header explicitly documents that
+  only Summon is supported because Autopark does not set the expected state.
+  `DI_autoparkState` values 3/4/9 gate its handoff. Without that latch, firmware
+  blocks stock `APS_eacMonitor` (0x27d) and steering (0x488, except its stock-LKAS
+  exception), even while sunnypilot is disengaged; with openpilot longitudinal it
+  also blocks `DAS_control` (0x2b9) except during stock AEB. Python stopping its
+  own commands cannot restore these blocked stock frames. This matches the
+  symptom but is not a log-confirmed diagnosis of this particular car.
+- Always Offroad uses existing `OffroadMode`, which makes pandad select NO_OUTPUT
+  and restores the physical stock CAN connection through the intercept relay.
+  This explains why it can work when ordinary disengagement does not. There is
+  no existing Tesla safety parameter for an Autopark-only passthrough mode.
+- Upstream checked 2026-09-26: both live opendbc master and the official
+  [release-mici safety source](https://raw.githubusercontent.com/sunnypilot/sunnypilot/release-mici/opendbc_repo/opendbc/safety/modes/tesla.h)
+  retain the limitation. [PR #2902, Tesla: Fix Autopark](https://github.com/commaai/opendbc/pull/2902)
+  remains an open, unmerged draft, at head
+  `73df7251978dcf3ed731b20fdd6a5daa4e14f84c`, updated September 23-24. Its current
+  proposal expands stock-steering passthrough beyond LKAS when stock steering
+  starts with controls disallowed. It changes safety firmware and Python/test
+  code. Physical Autopark/TACC validation remains unfinished in the checklist.
+  Do not confuse ordinary driving replay results with parking validation.
+- The author's older [Autopark investigation](https://community.sunnypilot.ai/t/tesla-autopark-support/2701)
+  describes the same repeated-start/cancel symptom and explored
+  `DAS_autopilotState`. The current PR abandoned that detector because of slow
+  updates and overlap with FSD. Review the actual current patch, not just the
+  older forum post or PR description, before selecting an implementation.
+- Assessment: a convenience UI action reusing the established offroad workflow
+  could remain Python-only. Seamless stock parking support requires coordinated
+  stock-command forwarding and sunnypilot inhibition, a matching Panda safety
+  firmware build, and handoff/regression validation. Account for our MADS lateral
+  engagement and legacy steering encoding when adapting upstream code. Do not
+  deploy broad stock-command forwarding or direct safety-mode switching as an
+  unreviewed shortcut. Capture the actual failed sequence before implementing.
+- Evidence: `opendbc_repo/opendbc/safety/modes/tesla.h`,
+  `opendbc_repo/opendbc/car/tesla/carstate.py` and `carcontroller.py`,
+  `selfdrive/pandad/pandad.cc`, `selfdrive/pandad/panda_safety.cc`, and
+  `panda/board/main.c`. Read-only source/upstream review, with independent safety
+  review; no repository code executed, runtime edits, device operations, or new
+  firmware. Only this context record changed; no update was pushed.
 
 ### INSTALL-001 - Repair comma 4 installer repository alias
 
