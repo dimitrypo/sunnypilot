@@ -8,10 +8,11 @@ from openpilot.sunnypilot.selfdrive.controls.lib.tesla_steering_pause import Tes
 class TestTeslaSteeringPause:
   def setup_method(self):
     self.pause = TeslaSteeringPause()
-    self.CS = SimpleNamespace(steeringTorque=0.0, steeringRateDeg=0.0, steeringAngleDeg=0.0,
+    self.CS = SimpleNamespace(steeringTorque=0.0, steeringRateDeg=0.0, steeringAngleDeg=2.0,
                               steeringDisengage=False, steerFaultTemporary=False, steerFaultPermanent=False, canValid=True)
     self.now = 10.0
     self.target = 0.0
+    self.zero_since = None
 
   def step(self, *, torque=None, rate=None, angle=None, dt=0.01, active=True, valid=True, resume_allowed=True):
     for key, value in (("steeringTorque", torque), ("steeringRateDeg", rate), ("steeringAngleDeg", angle)):
@@ -19,7 +20,7 @@ class TestTeslaSteeringPause:
         setattr(self.CS, key, value)
     self.now += dt
     return self.pause.update(self.CS, requested_active=active, target_angle=self.target, sample_time=self.now, valid=valid,
-                             resume_allowed=resume_allowed)
+                             resume_allowed=resume_allowed, hands_on_zero_since=self.zero_since)
 
   def enter_pause(self):
     assert not self.step(torque=1.5)
@@ -61,11 +62,11 @@ class TestTeslaSteeringPause:
     self.enter_pause()
     self.assert_recovers_after(0.5, torque=0.5, angle=2)
 
-  def test_firm_settled_input_recovers_in_one_and_a_half_seconds_without_retrigger(self):
+  @pytest.mark.parametrize("torque", [-1.49, -0.8, 0.8, 1.49])
+  def test_firm_settled_input_remains_paused_without_a_timeout(self, torque):
     self.enter_pause()
-    self.assert_recovers_after(1.5, torque=1.0, angle=2)
-    for _ in range(100):
-      assert self.step()
+    for _ in range(1000):
+      assert not self.step(torque=torque, angle=2)
 
   def test_steady_offset_with_force_keeps_pause(self):
     self.enter_pause()
@@ -78,14 +79,14 @@ class TestTeslaSteeringPause:
     for _ in range(200):
       assert not self.step(torque=0.5, angle=10)
     self.target = 10
-    self.assert_recovers_after(0.2)
+    assert self.step()
 
   @pytest.mark.parametrize("angle_error", [-1.0, 0.0, 1.0])
-  @pytest.mark.parametrize("torque", [-1.49, -0.5, 0.5, 1.49])
-  def test_aligned_held_wheel_recovers_without_retrigger(self, angle_error, torque):
+  @pytest.mark.parametrize("torque,rate", [(-4.0, -90.0), (-0.5, 0.0), (0.5, 0.0), (4.0, 90.0)])
+  def test_aligned_held_wheel_recovers_immediately_without_retrigger(self, angle_error, torque, rate):
     self.enter_pause()
     self.target = 10.0
-    self.assert_recovers_after(0.2, torque=torque, angle=self.target + angle_error, rate=0)
+    assert self.step(torque=torque, angle=self.target + angle_error, rate=rate)
     assert self.pause.reason == "aligned"
     for _ in range(100):
       assert self.step()
@@ -95,64 +96,99 @@ class TestTeslaSteeringPause:
     self.enter_pause()
     self.assert_recovers_after(0.5, torque=0.5, angle=angle_error)
 
-  @pytest.mark.parametrize("rate", [-5.0, 5.0])
-  def test_moving_through_aligned_angle_does_not_resume(self, rate):
+  @pytest.mark.parametrize("angle", [-1.0001, 1.0001])
+  def test_strong_input_just_outside_alignment_keeps_pause(self, angle):
     self.enter_pause()
     for _ in range(100):
-      assert not self.step(torque=0.5, angle=0, rate=rate)
-    self.assert_recovers_after(0.2, rate=0)
+      assert not self.step(torque=2.0, angle=angle, rate=90)
+
+  def test_alignment_cannot_override_a_true_hard_disengagement(self):
+    self.enter_pause()
+    self.CS.steeringDisengage = True
+    for _ in range(100):
+      assert not self.step(torque=2.0, angle=0, rate=90)
+
+  def test_eps_release_recovers_despite_residual_torque_and_motion(self):
+    self.enter_pause()
+    self.zero_since = self.now
+    self.assert_recovers_after(0.2, torque=1.0, rate=20, angle=15)
+    assert self.pause.reason == "released_eps"
+    for _ in range(100):
+      assert self.step()  # Residual torque must not immediately pause again.
+    self.zero_since = None
+    for _ in range(5):
+      assert self.step()
+    assert not self.step()  # Renewed detected input restores ordinary entry.
+
+  def test_eps_release_does_not_inherit_time_from_before_the_handover(self):
+    self.enter_pause()
+    self.zero_since = self.now - 10
+    self.assert_recovers_after(0.2, torque=1.0)
 
   @pytest.mark.parametrize("torque", [-1.5, 1.5])
-  def test_strong_override_beats_alignment(self, torque):
+  def test_renewed_strong_force_vetoes_filtered_eps_release(self, torque):
     self.enter_pause()
+    self.zero_since = self.now
     for _ in range(100):
-      assert not self.step(torque=torque, angle=0, rate=0)
+      assert not self.step(torque=torque)
+    self.assert_recovers_after(0.2, torque=1.0)
 
-  def test_release_and_alignment_share_continuous_recovery_time(self):
+  def test_new_eps_zero_interval_resets_release_evidence(self):
     self.enter_pause()
-    assert not self.step(torque=0.19)
+    self.zero_since = self.now
+    for _ in range(19):
+      assert not self.step(torque=1.0)
+    self.zero_since = self.now + 0.01
+    self.assert_recovers_after(0.2)
+
+  def test_unavailable_eps_signal_cannot_release_firm_input(self):
+    self.enter_pause()
+    self.zero_since = self.now
+    for _ in range(19):
+      assert not self.step(torque=1.0)
+    self.zero_since = None
+    for _ in range(200):
+      assert not self.step()
+
+  def test_torque_and_eps_release_do_not_restart_same_quiet_period(self):
+    self.enter_pause()
+    self.zero_since = self.now
+    assert not self.step(torque=0.1)
     for i in range(19):
-      assert not self.step(torque=0.21 if i % 2 == 0 else 0.19)
-    assert self.step(torque=0.21)
+      assert not self.step(torque=0.9 if i % 2 else 0.1)
+    assert self.step(torque=0.9)
 
-  def test_leaving_alignment_restarts_fast_recovery(self):
-    self.enter_pause()
-    for _ in range(15):
-      assert not self.step(torque=1.0, angle=0)
-    assert not self.step(angle=1.01)
-    self.assert_recovers_after(0.2, angle=0)
+  def test_confirmed_eps_zero_defers_moderate_entry_until_holding_is_reported(self):
+    self.zero_since = self.now - 1
+    for _ in range(30):
+      assert self.step(torque=1.0, rate=20, angle=5)
+    # EPS is filtered: the normal entry debounce starts when that estimate
+    # changes, whereas current strong force still takes priority immediately.
+    self.zero_since = None
+    for _ in range(5):
+      assert self.step()
+    assert not self.step()
 
-  @pytest.mark.parametrize("torque,delay", [(0.5, 0.5), (1.0, 1.5)])
-  def test_alignment_boundary_noise_does_not_delay_ordinary_recovery(self, torque, delay):
+  @pytest.mark.parametrize("zero_since", [float('nan'), float('inf'), -1.0, 100.0])
+  def test_invalid_eps_interval_cannot_release_firm_input(self, zero_since):
     self.enter_pause()
-    assert not self.step(torque=torque, angle=0.99)
-    for i in range(round(delay / 0.01) - 1):
-      assert not self.step(angle=1.01 if i % 2 == 0 else 0.99)
-    assert self.step(angle=1.01)
+    self.zero_since = zero_since
+    for _ in range(100):
+      assert not self.step(torque=1.0)
 
-  def test_renewed_correction_resets_both_recovery_timers(self):
-    self.enter_pause()
-    for _ in range(45):
-      assert not self.step(torque=0.5, angle=2)
-    for _ in range(10):
-      assert not self.step(angle=10)
-    self.assert_recovers_after(0.2, angle=0)
-
-  def test_planner_change_resets_alignment_recovery(self):
-    self.enter_pause()
-    for _ in range(15):
-      assert not self.step(torque=0.5, angle=0)
+  def test_alignment_is_rechecked_when_planner_changes(self):
+    assert self.step(torque=2, angle=0, rate=90)
     self.target = 5.0
     assert not self.step()
     self.target = 0.0
-    self.assert_recovers_after(0.2)
+    assert self.step()
 
   def test_continued_maneuver_keeps_pause(self):
     self.enter_pause()
     for _ in range(500):
       assert not self.step(torque=0.5, rate=10)
 
-  def test_release_shortens_firm_delay(self):
+  def test_release_ends_firm_hold_after_point_two_seconds(self):
     self.enter_pause()
     for _ in range(100):
       assert not self.step(torque=1.0, angle=2)
@@ -169,7 +205,9 @@ class TestTeslaSteeringPause:
     self.enter_pause()
     for _ in range(10):
       assert not self.step(torque=0)
-    self.assert_recovers_after(1.5, torque=1.0, angle=2)
+    for _ in range(200):
+      assert not self.step(torque=1.0, angle=2)
+    self.assert_recovers_after(0.5, torque=0.5)
 
   def test_disengaged_state_cannot_be_enabled_by_timer(self):
     self.enter_pause()
@@ -220,6 +258,17 @@ class TestTeslaSteeringPause:
     for _ in range(19):
       assert not self.step()
     assert self.step()
+
+  def test_duplicate_sample_cannot_trigger_alignment_recovery(self):
+    self.enter_pause()
+    assert not self.step(angle=0, dt=0)
+    assert self.step()
+
+  def test_alignment_waits_for_envelope_only_when_recovering(self):
+    self.enter_pause()
+    assert not self.step(angle=0, resume_allowed=False)
+    assert self.step(resume_allowed=True)
+    assert self.step(resume_allowed=False)  # Do not newly pause active steering.
 
   def test_sample_gap_is_not_counted_as_release(self):
     self.enter_pause()

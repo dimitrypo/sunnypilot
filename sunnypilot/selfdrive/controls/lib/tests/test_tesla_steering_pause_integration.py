@@ -5,14 +5,17 @@ from types import SimpleNamespace
 import pytest
 
 from cereal import car, log
+from opendbc.can import CANPacker
+from opendbc.car import Bus
 from opendbc.car.lateral import apply_steer_angle_limits_vm, get_max_angle_delta_vm, get_max_angle_vm
 from opendbc.car.tesla.carcontroller import get_safety_CP
 from opendbc.car.tesla.interface import CarInterface
-from opendbc.car.tesla.values import CarControllerParams
+from opendbc.car.tesla.values import CAR, CANBUS, DBC, CarControllerParams
 from opendbc.car.vehicle_model import VehicleModel
 from openpilot.selfdrive.controls.lib.latcontrol_angle import LatControlAngle
 from openpilot.selfdrive.controls.lib.longcontrol import LongControl
 from openpilot.sunnypilot.selfdrive.controls.controlsd_ext import ControlsExt
+from openpilot.sunnypilot.selfdrive.controls.lib.tesla_hands_on import TeslaHandsOnMonitor
 from openpilot.sunnypilot.selfdrive.controls.lib.tesla_steering_pause import TeslaSteeringPause
 
 
@@ -37,9 +40,12 @@ class TestTeslaSteeringPauseIntegration:
     self.controls = ControlsExt.__new__(ControlsExt)
     self.controls.tesla_steering_pause = TeslaSteeringPause()
     self.controls.tesla_safety_vm = VehicleModel(get_safety_CP())
+    self.controls.tesla_hands_on = None
+    self.controls.tesla_can_sock = None
+    self.controls.tesla_pause_log_time = None
     self.controls.VM = SimpleNamespace(get_steer_from_curvature=mocker.Mock(side_effect=lambda curvature, speed, roll: curvature))
     self.controls.blinker_pause_lateral = SimpleNamespace(update=mocker.Mock(return_value=False))
-    self.CS = SimpleNamespace(steeringTorque=0.0, steeringRateDeg=0.0, steeringAngleDeg=0.0, vEgo=20.0, vEgoRaw=20.0,
+    self.CS = SimpleNamespace(steeringTorque=0.0, steeringRateDeg=0.0, steeringAngleDeg=2.0, vEgo=20.0, vEgoRaw=20.0,
                               steeringDisengage=False, steerFaultTemporary=False, steerFaultPermanent=False, canValid=True)
     self.ss = SimpleNamespace(active=True, enabled=True)
     self.mads = SimpleNamespace(available=False, active=False)
@@ -204,6 +210,58 @@ class TestTeslaSteeringPauseIntegration:
     self.sm.logMonoTime["carState"] += 10_000_000
     return self.controls.state_control()
 
+  def enable_can_hands_monitor(self):
+    self.controls.tesla_hands_on = TeslaHandsOnMonitor()
+    self.controls.tesla_can_sock = object()
+    self.hands_level = 2
+    packer = CANPacker(DBC[CAR.TESLA_MODEL_3][Bus.party])
+
+    def receive_can(sock):
+      assert sock is self.controls.tesla_can_sock
+      event = log.Event.new_message(valid=True, logMonoTime=self.sm.logMonoTime["carState"])
+      msg = event.init("can", 1)[0]
+      msg.address, msg.dat, msg.src = packer.make_can_msg("EPAS3S_sysStatus", CANBUS.party, {"EPAS3S_handsOnLevel": self.hands_level})
+      return [event.to_bytes()]
+
+    self.mocker.patch("openpilot.sunnypilot.selfdrive.controls.controlsd_ext.messaging.drain_sock_raw", side_effect=receive_can)
+    self.mocker.patch("openpilot.sunnypilot.selfdrive.controls.controlsd_ext.time.monotonic_ns",
+                      side_effect=lambda: self.sm.logMonoTime["carState"])
+
+  def test_actual_controller_uses_fresh_eps_release_without_settling_or_repause(self):
+    controls = self.actual_controls()
+    self.enable_can_hands_monitor()
+    CC, _ = self.state_control_step()
+    assert CC.longActive and not CC.latActive
+    self.CS.steeringTorque = 1.0
+    self.CS.steeringRateDeg = 20.0
+    for _ in range(200):
+      CC, _ = self.state_control_step()
+      assert CC.longActive and not CC.latActive  # Held input has no 1.5s fallback.
+    self.hands_level = 0
+    for _ in range(20):
+      CC, _ = self.state_control_step()
+      assert CC.longActive and not CC.latActive
+    for _ in range(200):
+      CC, _ = self.state_control_step()
+      assert CC.longActive and CC.latActive
+      assert self.CS.steeringPressed  # Read-only EPS observer does not rewrite DM.
+    assert controls.tesla_steering_pause.reason == "released_eps"
+    self.CS.steeringTorque = 1.5
+    CC, _ = self.state_control_step()
+    assert CC.longActive and not CC.latActive
+
+  def test_aligned_recovery_still_requires_fresh_actuator_output(self):
+    self.CS.steeringTorque = 2.0
+    assert not self.step()
+    self.CS.steeringAngleDeg = 0.0
+    self.CS.steeringRateDeg = 20.0
+    self.sm.alive["carOutput"] = False
+    assert not self.step()
+    self.sm.alive["carOutput"] = True
+    assert self.step()
+    self.sm.alive["carOutput"] = False
+    assert self.step()  # A recovery gate does not newly disable active steering.
+
   def test_actual_controller_preserves_speed_and_resumes_from_measured_angle(self):
     controls = self.actual_controls()
     CC, lateral_log = self.state_control_step()
@@ -241,11 +299,9 @@ class TestTeslaSteeringPauseIntegration:
     CC, _ = self.state_control_step()
     assert CC.enabled and CC.longActive and not CC.latActive
     self.CS.steeringAngleDeg = direction * 0.5
-    self.CS.steeringTorque = direction * 1.2
+    self.CS.steeringTorque = direction * 2.0
+    self.CS.steeringRateDeg = direction * 20.0
     self.CS.steeringPressed = True
-    for _ in range(20):
-      CC, _ = self.state_control_step()
-      assert CC.enabled and CC.longActive and not CC.latActive
     CC, lateral_log = self.state_control_step()
     assert CC.enabled and CC.longActive and CC.latActive and lateral_log.active
     assert self.CS.steeringPressed
@@ -265,8 +321,6 @@ class TestTeslaSteeringPauseIntegration:
     for _ in range(100):
       assert not self.step(curvature=0.0)
     self.sm["liveParameters"].angleOffsetDeg = 1.0
-    for _ in range(20):
-      assert not self.step(curvature=-math.radians(9))
     assert self.step(curvature=-math.radians(9))
     assert self.controls.tesla_steering_pause.reason == "aligned"
 

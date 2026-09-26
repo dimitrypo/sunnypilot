@@ -22,6 +22,7 @@ from openpilot.sunnypilot.livedelay.helpers import get_lat_delay
 from openpilot.sunnypilot.modeld_v2.modeld_base import ModelStateBase
 from openpilot.sunnypilot.selfdrive.controls.lib.blinker_pause_lateral import BlinkerPauseLateral
 from openpilot.sunnypilot.selfdrive.controls.lib.latcontrol_torque_v0 import LatControlTorque as LatControlTorqueV0
+from openpilot.sunnypilot.selfdrive.controls.lib.tesla_hands_on import TeslaHandsOnMonitor
 from openpilot.sunnypilot.selfdrive.controls.lib.tesla_steering_pause import TeslaSteeringPause
 
 
@@ -34,6 +35,9 @@ class ControlsExt(ModelStateBase):
     self.blinker_pause_lateral = BlinkerPauseLateral()
     self.tesla_steering_pause = TeslaSteeringPause() if CP.carFingerprint == "TESLA_MODEL_3" else None
     self.tesla_safety_vm = VehicleModel(get_safety_CP()) if self.tesla_steering_pause is not None else None
+    self.tesla_hands_on = TeslaHandsOnMonitor() if self.tesla_steering_pause is not None else None
+    self.tesla_can_sock = messaging.sub_sock('can') if self.tesla_hands_on is not None else None
+    self.tesla_pause_log_time = None
 
     cloudlog.info("controlsd_ext is waiting for CarParamsSP")
     self.CP_SP = messaging.log_from_bytes(params.get("CarParamsSP", block=True), custom.CarParamsSP)
@@ -85,6 +89,9 @@ class ControlsExt(ModelStateBase):
 
     CS = sm['carState']
     lp = sm['liveParameters']
+    hands_on_zero_since = None
+    if self.tesla_hands_on is not None:
+      hands_on_zero_since = self.tesla_hands_on.update(messaging.drain_sock_raw(self.tesla_can_sock), time.monotonic_ns())
     # Use the live planner target, NOT the actuator output/current curvature that
     # deliberately tracks the measured wheel angle while lateral control is off.
     target_angle = math.degrees(self.VM.get_steer_from_curvature(-planned_curvature, CS.vEgo, lp.roll)) + lp.angleOffsetDeg
@@ -110,12 +117,20 @@ class ControlsExt(ModelStateBase):
       # override latch. Only the upstream engagement state can reset it.
       CS, requested_active=self.get_lat_requested(sm), target_angle=target_angle,
       sample_time=sm.logMonoTime['carState'] * 1e-9, valid=valid, resume_allowed=resume_allowed,
+      hands_on_zero_since=hands_on_zero_since,
     )
+    sample_time = sm.logMonoTime['carState'] * 1e-9
+    log_paused = self.tesla_steering_pause.paused and (self.tesla_pause_log_time is None or sample_time - self.tesla_pause_log_time >= 1.0)
     if (self.tesla_steering_pause.paused != paused_before or
         self.tesla_steering_pause.hard_disengaged != hard_disengaged_before or
+        log_paused or
         (self.tesla_steering_pause.reason != reason_before and "angle_limit" in (reason_before, self.tesla_steering_pause.reason))):
+      self.tesla_pause_log_time = sample_time
       cloudlog.event("tesla_steering_pause", paused=self.tesla_steering_pause.paused,
                      reason=self.tesla_steering_pause.reason,
+                     eps_reports_released=hands_on_zero_since is not None,
+                     resume_allowed=resume_allowed,
+                     wheel_rate_deg_s=CS.steeringRateDeg if math.isfinite(CS.steeringRateDeg) else None,
                      torque_nm=CS.steeringTorque if math.isfinite(CS.steeringTorque) else None,
                      angle_error_deg=CS.steeringAngleDeg - target_angle if math.isfinite(CS.steeringAngleDeg - target_angle) else None)
     return lat_active and active

@@ -202,22 +202,21 @@ silently removing their context.
   rewritten. The healthy main UI reflects steering unavailable as `long_only`.
 - Entry: at least 0.8 Nm of torque plus wheel motion of at least 5 degrees/s or
   planner-angle disagreement of at least 3 degrees, sustained for 0.05 seconds.
-  At least 1.5 Nm yields immediately. These are initial, uncalibrated thresholds
-  in `TeslaSteeringPause`, not measured guarantees about this vehicle.
-- While paused: at least 0.3 Nm with continuing movement/angle disagreement keeps
-  the pause, including a stationary wheel holding an offset; at least 1.5 Nm also
-  keeps it paused. TESLA-003 revises recovery: continuous torque at or below
-  0.2 Nm resumes after 0.2 seconds, light input below 0.8 Nm after 0.5 seconds,
-  and firm settled input after 1.5 seconds. A settled wheel within 1 degree of
-  the independent planner target also qualifies for 0.2-second recovery with
-  hands still holding it, provided torque remains below 1.5 Nm and wheel motion
-  below 5 degrees/s. A change of torque category starts its ordinary quiet
-  period; release and alignment share a separate fast timer. Alignment-boundary
-  noise does not restart the ordinary timer. Renewed correction resets both.
-  Clear release qualifies even with residual angle disagreement or wheel motion.
+  At least 1.5 Nm yields immediately. TESLA-004 exempts alignment within 1 degree
+  and suppresses moderate entry while fresh EPS release is confirmed. These are
+  uncalibrated thresholds, not measured guarantees about this vehicle.
+- Current recovery (TESLA-004 supersedes TESLA-003): alignment within 1 degree
+  of the independent planner target resumes immediately regardless of ordinary
+  torque or movement. Outside that band, release qualifies after 0.2 seconds
+  without settling; settled light input qualifies after 0.5 seconds; firm input
+  remains paused with no automatic timeout. Fresh EPS hands-on level zero can
+  establish release below 1.5 Nm despite residual torque; the original torque
+  <=0.2 Nm path remains available. Hard disengagement, faults, freshness, and
+  the existing re-entry angle envelope still take priority.
 - Signals: torque, wheel angle/rate, and an independent live planner target.
   No physical hand-contact/count sensor is available to this helper. Raw Tesla
-  `hands_on_level` is not in the published CarState schema; the firmware still
+  `hands_on_level` is not in the published CarState schema; TESLA-004 reads fresh
+  EPS CAN messages separately, without changing that schema. The firmware still
   reads it independently. A relaxed hold can resemble release after EPS yields.
 - Integration: the lateral controller resets/tracks actual steering while paused;
   return goes through existing curvature and angle/rate limits. Automatic recovery
@@ -257,7 +256,7 @@ silently removing their context.
   repository mount, masked `AGENTS.md`/`.vscode`/`.git`, and temporary dependency
   storage. No host dependency installation. This original validation did not
   include a vehicle, real-route replay, or physical handover; subsequent user
-  feedback and updated tests are recorded in TESLA-003.
+  feedback and updated tests are recorded in TESLA-003 and TESLA-004.
 - Upstream maintenance: retain Tesla firmware detection, independent hard
   overrides, and controller limits; reconcile upstream changes to `latActive`,
   MADS, planner target selection, timestamps, and UI status carefully. A broader
@@ -352,6 +351,8 @@ on hardware; its source and prebuilt binaries are unchanged.
 
 ### TESLA-003 - Faster recovery after steering handover
 
+- Status: historical recovery policy, superseded by TESLA-004 below. Its delivery
+  instructions and unchanged hard-disengagement/actuator limits still apply.
 - Request: after successful installation, the user reported delayed recovery
   after avoiding a pothole, recentering, and releasing the wheel, allowing drift
   toward another lane. Reduce release recovery to 0.2 seconds, allow recovery
@@ -415,6 +416,82 @@ on hardware; its source and prebuilt binaries are unchanged.
   roles, inclusive 1-degree boundary, movement/strong-input veto, and original
   hard-disengagement/envelope guards. Revalidate actual applied steering limits
   rather than assuming the intermediate curvature request has already caught up.
+
+### TESLA-004 - Immediate aligned handback and EPS-assisted release
+
+- Request: the user reports TESLA-003 is substantially better, but releasing the
+  wheel can still feel like a 1.5-second wait. Resume immediately within +/-1
+  degree even with strong input or active steering. Outside alignment, keep firm
+  input paused, recover after 0.5 seconds of settled light input, and after 0.2
+  seconds of release without requiring the wheel to settle. Publish for the
+  existing updater. The clarification removes the former firm-input timeout.
+- Before: alignment required 0.2 seconds below both the strong-torque and motion
+  thresholds; settled firm input could resume after 1.5 seconds. Release used
+  only torque <=0.2 Nm, so residual torque could prevent that fast path. There
+  are no driving logs identifying the actual cause of the reported delay.
+- After, in priority order: unchanged hard-disengagement/fault/freshness guards;
+  immediate aligned recovery; release after 0.2 seconds; settled light input
+  after 0.5 seconds. Alignment is inclusive at +/-1 degree and ignores ordinary
+  torque and wheel rate, including while already active. Recovery from a pause
+  still requires measured and last-applied angles within the existing envelope.
+  Alignment does not bypass full disengagement or force an abrupt wheel step;
+  the existing downstream curvature, angle, and rate limits remain unchanged.
+- Outside alignment: torque >=0.8 Nm keeps steering paused unless fresh EPS
+  release qualifies below the strong threshold. Torque >=1.5 Nm always vetoes
+  timed release and yields immediately while active. Light input must have wheel
+  rate below 5 degrees/s and cannot hold a >=3-degree offset with >=0.3 Nm.
+  Continued input resets the quiet timer. There is no 1.5-second firm fallback.
+  As before, these torque thresholds are provisional vehicle-activity estimates.
+- Release detection: torque <=0.2 Nm or a fresh continuous EPS hands-on level
+  zero interval qualifies without a wheel-motion or angle-disagreement veto.
+  A Python-only `TeslaHandsOnMonitor` subscribes read-only to existing CAN in
+  controls and decodes `EPAS3S_sysStatus` (0x370, bus 0) with the existing parser.
+  It checks event validity, timestamps, frame length, parser checksum/counter
+  validity, and a 100 ms maximum gap. Missing/stale/invalid data is not release.
+  Nonzero levels reset the zero interval, including intermediate frames drained
+  during one controls cycle. Old zero time before the pause cannot count toward
+  recovery; duplicate carState samples cannot advance it. No schema, DBC,
+  dependency, driver-monitoring contact signal, firmware, or binary changed.
+- EPS classification is filtered, not a physical contact sensor. Confirmed EPS
+  release also suppresses moderate pause entry after handback so residual torque
+  cannot immediately pause steering again. The tradeoff is that renewed moderate
+  input (0.8 to <1.5 Nm) can wait for EPS to leave level zero before the existing
+  0.05-second entry debounce. The current CarState source documents about 0.25
+  seconds of filtering. Strong force still wins immediately outside alignment.
+  The old FrogTesla source also used EPS level zero, but with its own one-second
+  interval; this change follows the user's 0.2-second request, not that timeout.
+- Limits: immediate alignment has no dwell timer or wider sticky band; strong
+  input crossing the 1-degree boundary can alternate pause/active permission.
+  The planner target remains independent of paused actuator tracking and includes
+  the learned steering offset. Neither alignment nor EPS zero proves road
+  clearance or hands-off. Faults and angle limits may still delay recovery.
+  Speed control and true hard-disengagement behavior remain unchanged. Added
+  once-per-second paused diagnostics with reason, EPS release evidence, re-entry
+  permission, torque, angle error, and wheel rate to diagnose future delays.
+- Files: `sunnypilot/selfdrive/controls/controlsd_ext.py`,
+  `sunnypilot/selfdrive/controls/lib/tesla_steering_pause.py`,
+  `sunnypilot/selfdrive/controls/lib/tesla_hands_on.py`, their three focused test
+  files under `sunnypilot/selfdrive/controls/lib/tests/`, and `AGENTS.md`.
+  Commit subject: `fix: prioritize Tesla alignment and EPS release recovery`.
+- Validation: 143 tests and 26 subtests passed using the focused command above
+  plus `sunnypilot/selfdrive/controls/lib/tests/test_tesla_hands_on.py` and
+  `opendbc_repo/opendbc/sunnypilot/car/tesla/tests/test_steering_protocol.py`.
+  Ruff passed on all six changed/new Python files; Git whitespace checks passed.
+  Coverage includes strong/moving aligned recovery, indefinite firm hold, both
+  timed paths, residual-torque recovery remaining active, renewed-input latency,
+  CAN freshness/validity/order, actual CAN packer through controls integration,
+  retained speed control/contact signals, hard latches, and actuator limits.
+  Independent review covered the state machine and CAN monitor. Tests used
+  isolated Python 3.12, exact wheel versions/hashes from `uv.lock`, temporary
+  dependencies, read-only repository/root, masked agent/Git/editor files,
+  non-root execution, and a disconnected network. No host dependency installs.
+  This revision has no physical vehicle validation or route replay yet.
+- Delivery/maintenance: use the same fast-forward `release-mici` publication and
+  normal updater as TESLA-003; no reinstall or version bump is required. Preserve
+  existing prebuilt artifacts and installer alias. Reconcile CAN timestamp/parser
+  changes, the independent planner angle, alignment priority, EPS classification
+  latency, and the hard/fault/envelope guards during future upstream integration.
+  Reassess the separate CAN subscription if upstream publishes this raw signal.
 
 ### INSTALL-001 - Repair comma 4 installer repository alias
 
@@ -505,3 +582,8 @@ on hardware; its source and prebuilt binaries are unchanged.
   Implemented TESLA-003 on the same upstream base for delivery through the normal
   `release-mici` updater. Local validation passed; updated device behavior remains
   unverified until the user installs and evaluates this new revision.
+- 2026-09-26: user reported improved TESLA-003 behavior but remaining release
+  delays, and clarified immediate alignment and indefinite firm-input pause.
+  Implemented TESLA-004 with fresh EPS release evidence on the same upstream base;
+  143 tests and 26 subtests passed. Publishing to the existing `release-mici`
+  update branch is authorized; physical verification of this revision is pending.
