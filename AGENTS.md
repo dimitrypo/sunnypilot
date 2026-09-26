@@ -15,7 +15,11 @@ resolve conflicts, validate, and push the result to the fork.
   default branch; do not substitute `master`, `main`, or the old FrogTesla fork.
 - Setup context: `codex://threads/01a0dcdf-8627-7372-a2ab-f1650ba93749`.
 - Fork installer URL: `https://install.sunnypilot.ai/fork/dimitrypo/release-mici`.
-  The setup task verified the URL, but did not confirm installation on the device.
+  Verified with comma 4 setup headers after the INSTALL-001 alias repair below;
+  successful installation on the device remains unconfirmed.
+- GitHub installer alias: `dimitrypo/openpilot` redirects to this `sunnypilot`
+  repository. The unused FrogTesla repository is now `dimitrypo/legacy_openpilot`.
+  Preserve this alias: do not create or rename another repository to `openpilot`.
 
 The intended code changes are Python only. This is a prebuilt release tree:
 preserve its binaries, models, firmware, and `prebuilt` marker. Changes requiring
@@ -340,6 +344,55 @@ on hardware; its source and prebuilt binaries are unchanged.
   mode mapping onto that new format. Revalidate cooperative lane-keeping support
   against the new firmware before carrying over TESLA-001.
 
+### INSTALL-001 - Repair comma 4 installer repository alias
+
+- Request: resolve "No custom software found at this URL" from the recorded fork
+  installer URL, both with and without `https://`. The user confirmed sunnypilot
+  worked on this comma 4 immediately before uninstalling, and explicitly requested
+  renaming the unused old FrogTesla repository to `legacy_openpilot`.
+- Diagnosis: a plain desktop request returned a 1,295,328-byte installer pointing
+  directly to `dimitrypo/sunnypilot`. With `User-Agent: AGNOSSetup-18.4` and
+  `X-openpilot-device-type: mici`, the same URL instead returned HTTP 200 with
+  61 bytes of text: "This version of openpilot is not compatible with this
+  device." `system/ui/mici_setup.py` rejects a non-ELF response with the exact
+  message shown in the photo. Neither spelling nor the optional URL scheme was
+  the problem. The simulated OS version came from `launch_env.sh`; no real device
+  serial was sent and the device's actual OS version was not independently read.
+- The official comma 4 installer embeds a GitHub `openpilot.git` address even
+  when requested through the sunnypilot fork endpoint. Official
+  `sunnypilot/openpilot` already redirects to `sunnypilot/sunnypilot`; the personal
+  `dimitrypo/openpilot` instead contained old FrogTesla branches and no
+  `release-mici`. Current installer service source was unavailable; the response,
+  embedded destination, and successful repair establish the routing dependency.
+- Repair: renamed the old repository to `dimitrypo/legacy_openpilot`, preserving
+  repository ID `861714415` and default branch `frogtesla`. Then temporarily
+  renamed this fork `sunnypilot -> openpilot -> sunnypilot`, preserving repository
+  ID `1388928190`, default branch `release-mici`, and all commits. This is the
+  [installer generator's documented alias technique](https://github.com/sshane/openpilot-installer-generator#aliases),
+  using [GitHub rename redirects](https://docs.github.com/en/repositories/creating-and-managing-repositories/renaming-a-repository).
+  Canonical origin remains `https://github.com/dimitrypo/sunnypilot.git`. The
+  installer may save the `openpilot.git` alias as device origin; Git fetch/push
+  redirects then reach the same current sunnypilot repository. The legacy
+  repository must now be addressed by its new name.
+- Validation: GitHub API confirmed the alias resolves to the current sunnypilot
+  repository ID and the old fork remains separate. `git ls-remote` through the
+  alias returned the published `release-mici` tip. The original installer URL,
+  with the same setup headers that previously failed, now returned a
+  2,051,392-byte ELF64 AArch64 installer embedding
+  `https://github.com/dimitrypo/openpilot.git` and `release-mici`. This verifies
+  endpoint delivery and repository selection, not an end-to-end device install.
+- Files/commit: only `AGENTS.md`; commit subject
+  `docs: record comma 4 installer alias repair`. No driving code, prebuilt
+  artifacts, firmware, dependencies, or device state changed. A dedicated
+  installer was considered and prepared temporarily during diagnosis, but was
+  not published or retained in this repository after the alias repair worked.
+- Future maintenance: preserve the alias and check both GitHub repository IDs
+  and branch SHA if installation fails again. Always test installers with the
+  setup User-Agent and `X-openpilot-device-type: mici`, then inspect the actual
+  payload and embedded repository/branch. HTTP 200 or a desktop-only download is
+  insufficient. Do not recreate the old `openpilot` repository name, which would
+  replace this redirect and break installation/updates through the alias.
+
 ## Maintenance history
 
 - 2026-09-26: established this workflow on base
@@ -356,13 +409,22 @@ on hardware; its source and prebuilt binaries are unchanged.
   `e6dc91b` (TESLA-001) and `49f2931` (TESLA-002); these are publication-era
   references, not stable IDs after a future replay. No runtime changes were added
   during publication; the recorded 74 tests and 26 subtests remain applicable.
-  The exact fork installer URL returned HTTP 200. Read-only inspection of its
-  ARM64 installer confirmed `https://github.com/dimitrypo/sunnypilot.git`,
+  A desktop request to the exact fork installer URL returned HTTP 200. Read-only
+  inspection of that response's ARM64 installer confirmed
+  `https://github.com/dimitrypo/sunnypilot.git`,
   `git checkout release-mici`, and `git reset --hard origin/release-mici`:
   it selects the published branch tip, not a pinned older release. The launcher
   sets PYTHONPATH to that checkout; card, controlsd, and UI are Python processes,
   so these source changes are used with the retained prebuilt artifacts. Normal
   updates fetch the configured origin. Uninstall/Custom Software installation
-  through the recorded URL is the intended first-install path. Remote publication
-  must be checked against GitHub after pushing; device installation and driving
-  behavior still require separate verification.
+  through the recorded URL is the intended first-install path. This initial
+  check omitted setup device headers and therefore did not verify the actual
+  comma 4 response; INSTALL-001 records the subsequently reproduced failure and
+  repair. Remote publication must be checked against GitHub after pushing; device
+  installation and driving behavior still require separate verification.
+- 2026-09-26: completed INSTALL-001 after the user's failed installation report.
+  Renamed the unused FrogTesla repository to `legacy_openpilot` as requested and
+  established `openpilot` as a GitHub alias for the current `sunnypilot` fork.
+  Verified the original URL now returns the comma 4 installer with device setup
+  headers and Git through the alias reaches the published personal branch.
+  Runtime changes remain TESLA-001 and TESLA-002; device installation is pending.
