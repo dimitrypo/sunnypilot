@@ -1,5 +1,7 @@
 from types import SimpleNamespace
 
+import pytest
+
 from openpilot.sunnypilot.selfdrive.controls.lib.tesla_steering_pause import TeslaSteeringPause
 
 
@@ -51,17 +53,17 @@ class TestTeslaSteeringPause:
     for _ in range(400):
       assert not self.step()
 
-  def test_no_input_recovers_in_half_a_second_despite_angle_or_wheel_return(self):
+  def test_no_input_recovers_in_point_two_seconds_despite_angle_or_wheel_return(self):
     self.enter_pause()
-    self.assert_recovers_after(0.5, torque=0.1, rate=20, angle=15)
+    self.assert_recovers_after(0.2, torque=0.1, rate=20, angle=15)
 
-  def test_light_settled_input_recovers_in_one_second(self):
+  def test_light_settled_input_recovers_in_half_a_second(self):
     self.enter_pause()
-    self.assert_recovers_after(1.0, torque=0.5)
+    self.assert_recovers_after(0.5, torque=0.5, angle=2)
 
-  def test_firm_settled_input_recovers_in_three_seconds_without_retrigger(self):
+  def test_firm_settled_input_recovers_in_one_and_a_half_seconds_without_retrigger(self):
     self.enter_pause()
-    self.assert_recovers_after(3.0, torque=1.0)
+    self.assert_recovers_after(1.5, torque=1.0, angle=2)
     for _ in range(100):
       assert self.step()
 
@@ -69,14 +71,81 @@ class TestTeslaSteeringPause:
     self.enter_pause()
     for _ in range(500):
       assert not self.step(torque=0.5, angle=10, rate=0)
-    self.assert_recovers_after(0.5, torque=0)
+    self.assert_recovers_after(0.2, torque=0)
 
   def test_live_target_agreement_can_end_hold(self):
     self.enter_pause()
     for _ in range(200):
       assert not self.step(torque=0.5, angle=10)
     self.target = 10
-    self.assert_recovers_after(1.0)
+    self.assert_recovers_after(0.2)
+
+  @pytest.mark.parametrize("angle_error", [-1.0, 0.0, 1.0])
+  @pytest.mark.parametrize("torque", [-1.49, -0.5, 0.5, 1.49])
+  def test_aligned_held_wheel_recovers_without_retrigger(self, angle_error, torque):
+    self.enter_pause()
+    self.target = 10.0
+    self.assert_recovers_after(0.2, torque=torque, angle=self.target + angle_error, rate=0)
+    assert self.pause.reason == "aligned"
+    for _ in range(100):
+      assert self.step()
+
+  @pytest.mark.parametrize("angle_error", [-1.0001, 1.0001])
+  def test_just_outside_alignment_uses_light_contact_delay(self, angle_error):
+    self.enter_pause()
+    self.assert_recovers_after(0.5, torque=0.5, angle=angle_error)
+
+  @pytest.mark.parametrize("rate", [-5.0, 5.0])
+  def test_moving_through_aligned_angle_does_not_resume(self, rate):
+    self.enter_pause()
+    for _ in range(100):
+      assert not self.step(torque=0.5, angle=0, rate=rate)
+    self.assert_recovers_after(0.2, rate=0)
+
+  @pytest.mark.parametrize("torque", [-1.5, 1.5])
+  def test_strong_override_beats_alignment(self, torque):
+    self.enter_pause()
+    for _ in range(100):
+      assert not self.step(torque=torque, angle=0, rate=0)
+
+  def test_release_and_alignment_share_continuous_recovery_time(self):
+    self.enter_pause()
+    assert not self.step(torque=0.19)
+    for i in range(19):
+      assert not self.step(torque=0.21 if i % 2 == 0 else 0.19)
+    assert self.step(torque=0.21)
+
+  def test_leaving_alignment_restarts_fast_recovery(self):
+    self.enter_pause()
+    for _ in range(15):
+      assert not self.step(torque=1.0, angle=0)
+    assert not self.step(angle=1.01)
+    self.assert_recovers_after(0.2, angle=0)
+
+  @pytest.mark.parametrize("torque,delay", [(0.5, 0.5), (1.0, 1.5)])
+  def test_alignment_boundary_noise_does_not_delay_ordinary_recovery(self, torque, delay):
+    self.enter_pause()
+    assert not self.step(torque=torque, angle=0.99)
+    for i in range(round(delay / 0.01) - 1):
+      assert not self.step(angle=1.01 if i % 2 == 0 else 0.99)
+    assert self.step(angle=1.01)
+
+  def test_renewed_correction_resets_both_recovery_timers(self):
+    self.enter_pause()
+    for _ in range(45):
+      assert not self.step(torque=0.5, angle=2)
+    for _ in range(10):
+      assert not self.step(angle=10)
+    self.assert_recovers_after(0.2, angle=0)
+
+  def test_planner_change_resets_alignment_recovery(self):
+    self.enter_pause()
+    for _ in range(15):
+      assert not self.step(torque=0.5, angle=0)
+    self.target = 5.0
+    assert not self.step()
+    self.target = 0.0
+    self.assert_recovers_after(0.2)
 
   def test_continued_maneuver_keeps_pause(self):
     self.enter_pause()
@@ -85,22 +154,22 @@ class TestTeslaSteeringPause:
 
   def test_release_shortens_firm_delay(self):
     self.enter_pause()
-    for _ in range(250):
-      assert not self.step(torque=1.0)
-    self.assert_recovers_after(0.5, torque=0.0)
+    for _ in range(100):
+      assert not self.step(torque=1.0, angle=2)
+    self.assert_recovers_after(0.2, torque=0.0)
 
   def test_renewed_input_restarts_quiet_period(self):
     self.enter_pause()
-    for _ in range(40):
+    for _ in range(10):
       assert not self.step(torque=0)
     assert not self.step(torque=1, rate=10)
-    self.assert_recovers_after(0.5, torque=0, rate=0)
+    self.assert_recovers_after(0.2, torque=0, rate=0)
 
   def test_change_to_firmer_contact_does_not_use_short_delay(self):
     self.enter_pause()
-    for _ in range(40):
+    for _ in range(10):
       assert not self.step(torque=0)
-    self.assert_recovers_after(3.0, torque=1.0)
+    self.assert_recovers_after(1.5, torque=1.0, angle=2)
 
   def test_disengaged_state_cannot_be_enabled_by_timer(self):
     self.enter_pause()
@@ -130,7 +199,7 @@ class TestTeslaSteeringPause:
       for _ in range(60):
         assert not self.step()
       setattr(self.CS, field, original)
-      self.assert_recovers_after(0.5)
+      self.assert_recovers_after(0.2)
 
   def test_invalid_message_and_target_reset_recovery(self):
     for bad_target in (False, True):
@@ -141,23 +210,23 @@ class TestTeslaSteeringPause:
       for _ in range(60):
         assert not self.step(torque=0, valid=bad_target)
       self.target = 0
-      self.assert_recovers_after(0.5)
+      self.assert_recovers_after(0.2)
 
   def test_duplicate_timestamp_does_not_advance_timer(self):
     self.enter_pause()
     assert not self.step(torque=0)
     for _ in range(1000):
       assert not self.step(dt=0)
-    for _ in range(49):
+    for _ in range(19):
       assert not self.step()
     assert self.step()
 
   def test_sample_gap_is_not_counted_as_release(self):
     self.enter_pause()
-    for _ in range(40):
+    for _ in range(10):
       assert not self.step(torque=0)
     assert not self.step(dt=1.0)
-    for _ in range(49):
+    for _ in range(19):
       assert not self.step()
     assert self.step()
 
@@ -177,8 +246,8 @@ class TestTeslaSteeringPause:
 
   def test_angle_envelope_permission_does_not_shortcut_release_timer(self):
     self.enter_pause()
-    for _ in range(30):
+    for _ in range(10):
       assert not self.step(torque=0, resume_allowed=False)
-    for _ in range(20):
+    for _ in range(10):
       assert not self.step(resume_allowed=True)
     assert self.step()

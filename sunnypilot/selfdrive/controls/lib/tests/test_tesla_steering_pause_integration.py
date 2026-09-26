@@ -59,7 +59,7 @@ class TestTeslaSteeringPauseIntegration:
     return self.controls.apply_tesla_steering_pause(self.sm, lat_active, curvature)
 
   def assert_release_delay(self):
-    for _ in range(50):
+    for _ in range(20):
       assert not self.step()
     assert self.step()
 
@@ -78,7 +78,7 @@ class TestTeslaSteeringPauseIntegration:
     self.CS.steeringTorque = 1.5
     assert not self.step()
     self.CS.steeringTorque = 0.0
-    for _ in range(40):
+    for _ in range(10):
       assert not self.step()
     self.CS.steerFaultTemporary = True
     assert not self.step(lat_active=False)
@@ -140,7 +140,7 @@ class TestTeslaSteeringPauseIntegration:
       self.CS.steeringTorque = 1.5
       assert not self.step()
       self.CS.steeringTorque = 0.0
-      for _ in range(40):
+      for _ in range(10):
         assert not self.step()
       self.sm.alive[selected_plan] = False
       assert not self.step()
@@ -216,15 +216,75 @@ class TestTeslaSteeringPauseIntegration:
     assert self.CS.steeringPressed  # No synthetic hands-off signal was substituted.
 
     self.CS.steeringTorque = 0.0
-    for _ in range(50):
+    for _ in range(20):
       CC, _ = self.state_control_step()
       assert CC.enabled and CC.longActive and not CC.latActive
       assert CC.actuators.accel > 0
       assert CC.actuators.steeringAngleDeg == self.CS.steeringAngleDeg
     CC, lateral_log = self.state_control_step()
     assert CC.enabled and CC.longActive and CC.latActive and lateral_log.active
-    assert 0 < self.CS.steeringAngleDeg - CC.actuators.steeringAngleDeg < 1.0
+    # With the faster handback, the intermediate curvature request can still
+    # lag measured steering. Check the command after the real Tesla limiter,
+    # which enforces continuity against the last inactive (measured) angle.
+    applied_angle = apply_steer_angle_limits_vm(CC.actuators.steeringAngleDeg, self.CS.steeringAngleDeg,
+                                               self.CS.vEgoRaw, self.CS.steeringAngleDeg, CC.latActive,
+                                               CarControllerParams, controls.tesla_safety_vm)
+    max_step = min(get_max_angle_delta_vm(self.CS.vEgoRaw, controls.tesla_safety_vm, CarControllerParams),
+                   CarControllerParams.ANGLE_LIMITS.MAX_ANGLE_RATE)
+    assert 0 < self.CS.steeringAngleDeg - applied_angle <= max_step + 1e-9
+    assert abs(applied_angle) <= get_max_angle_vm(self.CS.vEgoRaw, controls.tesla_safety_vm, CarControllerParams)
     assert controls.LoC.reset.call_count == 0
+
+  @pytest.mark.parametrize("direction", [-1, 1])
+  def test_actual_controller_resumes_aligned_with_hands_still_detected(self, direction):
+    controls = self.actual_controls()
+    CC, _ = self.state_control_step()
+    assert CC.enabled and CC.longActive and not CC.latActive
+    self.CS.steeringAngleDeg = direction * 0.5
+    self.CS.steeringTorque = direction * 1.2
+    self.CS.steeringPressed = True
+    for _ in range(20):
+      CC, _ = self.state_control_step()
+      assert CC.enabled and CC.longActive and not CC.latActive
+    CC, lateral_log = self.state_control_step()
+    assert CC.enabled and CC.longActive and CC.latActive and lateral_log.active
+    assert self.CS.steeringPressed
+    assert abs(CC.actuators.steeringAngleDeg - self.CS.steeringAngleDeg) < 1.0
+    for _ in range(100):
+      CC, _ = self.state_control_step()
+      assert CC.enabled and CC.longActive and CC.latActive
+    assert controls.LoC.reset.call_count == 0
+
+  def test_alignment_uses_independent_live_plan_including_angle_offset(self):
+    self.CS.steeringTorque = 1.5
+    self.CS.steeringAngleDeg = 10.0
+    assert not self.step()
+    self.CS.steeringTorque = 1.0
+    self.controls.curvature = self.controls.desired_curvature = -math.radians(10)
+    self.sm["carOutput"].actuatorsOutput.steeringAngleDeg = 10.0
+    for _ in range(100):
+      assert not self.step(curvature=0.0)
+    self.sm["liveParameters"].angleOffsetDeg = 1.0
+    for _ in range(20):
+      assert not self.step(curvature=-math.radians(9))
+    assert self.step(curvature=-math.radians(9))
+    assert self.controls.tesla_steering_pause.reason == "aligned"
+
+  def test_alignment_cannot_bypass_angle_envelope_or_hard_override(self):
+    self.CS.steeringTorque = 1.5
+    self.CS.steeringAngleDeg = 30.0
+    assert not self.step()
+    self.CS.steeringTorque = 1.0
+    for _ in range(100):
+      assert not self.step(curvature=-math.radians(30))
+    assert self.controls.tesla_steering_pause.reason == "angle_limit"
+    self.CS.steeringDisengage = True
+    assert not self.step(curvature=-math.radians(30))
+    self.CS.steeringDisengage = False
+    self.CS.steeringAngleDeg = 0.0
+    for _ in range(100):
+      assert not self.step()
+    assert self.controls.tesla_steering_pause.hard_disengaged
 
   def test_actual_controller_hard_override_survives_temporary_fault_clearance(self):
     controls = self.actual_controls()

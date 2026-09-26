@@ -16,7 +16,8 @@ resolve conflicts, validate, and push the result to the fork.
 - Setup context: `codex://threads/01a0dcdf-8627-7372-a2ab-f1650ba93749`.
 - Fork installer URL: `https://install.sunnypilot.ai/fork/dimitrypo/release-mici`.
   Verified with comma 4 setup headers after the INSTALL-001 alias repair below;
-  successful installation on the device remains unconfirmed.
+  the user subsequently confirmed successful installation and operation. See
+  TESLA-003 for feedback on recovery timing and the follow-up update.
 - GitHub installer alias: `dimitrypo/openpilot` redirects to this `sunnypilot`
   repository. The unused FrogTesla repository is now `dimitrypo/legacy_openpilot`.
   Preserve this alias: do not create or rename another repository to `openpilot`.
@@ -205,11 +206,15 @@ silently removing their context.
   in `TeslaSteeringPause`, not measured guarantees about this vehicle.
 - While paused: at least 0.3 Nm with continuing movement/angle disagreement keeps
   the pause, including a stationary wheel holding an offset; at least 1.5 Nm also
-  keeps it paused. Otherwise, continuous torque at or below 0.2 Nm resumes after
-  0.5 seconds, light input below 0.8 Nm after 1 second, and firm settled input
-  after 3 seconds. A change of input category starts its own quiet period. A clear
-  release takes the 0.5-second path even after a firm hold or with residual angle
-  disagreement. Renewed correction resets recovery.
+  keeps it paused. TESLA-003 revises recovery: continuous torque at or below
+  0.2 Nm resumes after 0.2 seconds, light input below 0.8 Nm after 0.5 seconds,
+  and firm settled input after 1.5 seconds. A settled wheel within 1 degree of
+  the independent planner target also qualifies for 0.2-second recovery with
+  hands still holding it, provided torque remains below 1.5 Nm and wheel motion
+  below 5 degrees/s. A change of torque category starts its ordinary quiet
+  period; release and alignment share a separate fast timer. Alignment-boundary
+  noise does not restart the ordinary timer. Renewed correction resets both.
+  Clear release qualifies even with residual angle disagreement or wheel motion.
 - Signals: torque, wheel angle/rate, and an independent live planner target.
   No physical hand-contact/count sensor is available to this helper. Raw Tesla
   `hands_on_level` is not in the published CarState schema; the firmware still
@@ -231,7 +236,7 @@ silently removing their context.
   double update). No CAN schema, safety policy, firmware, or binaries changed.
 - Limits: early yielding may avoid the hard cutoff, but slow force can still
   reach hands-on level 3 and fully disengage. A timed pause must never re-enable
-  a fully disengaged system. The 0.5-second delay is a signal-based recovery
+  a fully disengaged system. The 0.2-second delay is a signal-based recovery
   target, not proof of hands-off or a guarantee against lane departure. Faults or
   an angle outside the existing envelope can delay recovery beyond that timer,
   potentially indefinitely until the condition clears.
@@ -250,8 +255,9 @@ silently removing their context.
   and blocking recovery beyond the existing angle envelope. Used isolated Python
   3.12 with dependencies pinned from `uv.lock`, read-only
   repository mount, masked `AGENTS.md`/`.vscode`/`.git`, and temporary dependency
-  storage. No host dependency installation. No vehicle, real-route replay, or
-  physical handover validation has been performed.
+  storage. No host dependency installation. This original validation did not
+  include a vehicle, real-route replay, or physical handover; subsequent user
+  feedback and updated tests are recorded in TESLA-003.
 - Upstream maintenance: retain Tesla firmware detection, independent hard
   overrides, and controller limits; reconcile upstream changes to `latActive`,
   MADS, planner target selection, timestamps, and UI status carefully. A broader
@@ -344,6 +350,72 @@ on hardware; its source and prebuilt binaries are unchanged.
   mode mapping onto that new format. Revalidate cooperative lane-keeping support
   against the new firmware before carrying over TESLA-001.
 
+### TESLA-003 - Faster recovery after steering handover
+
+- Request: after successful installation, the user reported delayed recovery
+  after avoiding a pothole, recentering, and releasing the wheel, allowing drift
+  toward another lane. Reduce release recovery to 0.2 seconds, allow recovery
+  while holding the wheel within 1 degree of the planner target, and reduce
+  light/firm quiet periods from 1/3 seconds to 0.5/1.5 seconds. Publish through
+  the existing updater without requiring reinstallation.
+- Before: TESLA-001 required 0.5/1/3 seconds for released/light/firm input and
+  had no faster recovery when the held wheel agreed with the live planner.
+- After: released input (absolute torque <=0.2 Nm) qualifies after 0.2 seconds,
+  even while the wheel returns or differs from the planner. Settled alignment
+  within +/-1 degree qualifies after 0.2 seconds with hands still present,
+  provided absolute wheel rate is below 5 degrees/s and torque below 1.5 Nm.
+  Otherwise settled light input takes 0.5 seconds and firm input 1.5 seconds.
+  Strong input and continued torque-qualified maneuvering still keep the pause.
+  The angle comparison uses the independent live planner wheel angle, including
+  the learned steering offset; it does not prove lane position or obstacle
+  clearance. Recovery uses normal controller limits, not an abrupt steering step.
+- Timers: release/alignment share continuous fast eligibility so torque noise
+  around 0.2 Nm does not repeatedly reset it. The ordinary torque-category timer
+  is independent, so jitter just inside/outside 1 degree cannot indefinitely
+  restart the 0.5/1.5-second fallback. Renewed correction, invalid/faulted data,
+  and sample gaps reset both timers. Duplicate samples cannot advance recovery.
+- Retained limits: full disengagement/hard override never auto-resumes. The
+  measured and last applied angle envelope, actuator suppression, and freshness
+  checks remain authoritative. Low torque estimates release; no physical hands
+  sensor was added. Tesla's published `steeringPressed` is itself filtered torque
+  above 1 Nm, so false does not establish hands-off and is not used to override
+  continued corrections. Timers are not guarantees of real EPS acceptance or
+  recovery through a fault/angle-limit condition.
+- Diagnosis limit: the old delays and torque/movement categorization can explain
+  long recovery, but there are no driving logs identifying the actual blocking
+  condition in the reported event. Do not claim the reported drift is reproduced
+  or that this update is physically validated on the car.
+- Files: `sunnypilot/selfdrive/controls/lib/tesla_steering_pause.py`,
+  `sunnypilot/selfdrive/controls/lib/tests/test_tesla_steering_pause.py`,
+  `sunnypilot/selfdrive/controls/lib/tests/test_tesla_steering_pause_integration.py`,
+  and `AGENTS.md`. Commit subject:
+  `fix: shorten Tesla steering handover recovery`.
+- Validation: 102 tests and 26 subtests passed using the focused command above
+  plus `opendbc_repo/opendbc/sunnypilot/car/tesla/tests/test_steering_protocol.py`.
+  Ruff on all three changed Python files and Git whitespace checks passed.
+  Added timing boundaries, signed alignment/torque boundaries, continued
+  maneuver/strong override cases, both kinds of timer noise, live-plan offset,
+  retained speed control, hands-present recovery, and envelope/hard-latch checks.
+  Shortening the pause exposed lag in the intermediate curvature request; the
+  integration test now verifies the final command through the unchanged Tesla
+  limiter remains within its rate and angle bounds. No limiter was relaxed.
+  Independent review covered both timers and reset paths. Tests used Python 3.12
+  with exact versions and wheel hashes from `uv.lock`, temporary dependencies,
+  read-only repository/root, masked agent/Git/editor files, non-root execution,
+  and a disconnected network during tests. No host dependencies were installed.
+- Delivery: ordinary fast-forward commit on `origin/release-mici`; no version,
+  release-note, dependency, firmware, model, or prebuilt artifact changes needed.
+  The updater compares remote commit SHAs and stages Python source from origin;
+  the `openpilot` alias must continue to resolve to this fork. While parked and
+  online: Settings -> Software, keep Target Branch `release-mici`, then Download
+  -> CHECK -> DOWNLOAD, and Install Update -> INSTALL. The displayed Current
+  Version after reboot should contain the published commit's short SHA. A push
+  does not establish that the user has downloaded or installed the new update.
+- Upstream maintenance: retain the independent planner target and two timer
+  roles, inclusive 1-degree boundary, movement/strong-input veto, and original
+  hard-disengagement/envelope guards. Revalidate actual applied steering limits
+  rather than assuming the intermediate curvature request has already caught up.
+
 ### INSTALL-001 - Repair comma 4 installer repository alias
 
 - Request: resolve "No custom software found at this URL" from the recorded fork
@@ -428,3 +500,8 @@ on hardware; its source and prebuilt binaries are unchanged.
   Verified the original URL now returns the comma 4 installer with device setup
   headers and Git through the alias reaches the published personal branch.
   Runtime changes remain TESLA-001 and TESLA-002; device installation is pending.
+- 2026-09-26: user confirmed INSTALL-001 installation succeeded and the personal
+  behavior operates, then reported delayed steering recovery and lane drift.
+  Implemented TESLA-003 on the same upstream base for delivery through the normal
+  `release-mici` updater. Local validation passed; updated device behavior remains
+  unverified until the user installs and evaluates this new revision.

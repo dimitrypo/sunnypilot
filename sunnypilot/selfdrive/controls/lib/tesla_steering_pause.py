@@ -12,10 +12,11 @@ class TeslaSteeringPause:
   PAUSE_TORQUE = 0.8  # Nm, together with steering motion or target disagreement
   STRONG_TORQUE = 1.5  # Nm; yield immediately, without waiting for motion
   ANGLE_DISAGREEMENT = 3.0  # steering-wheel degrees
+  ALIGNMENT_ANGLE = 1.0  # steering-wheel degrees from the independent planner target
   STEERING_RATE = 5.0  # steering-wheel degrees/s
   ENTRY_DELAY = 0.05  # seconds of deliberate input; ignore isolated small spikes
   MAX_SAMPLE_GAP = 0.1  # a gap cannot count as evidence of continuous release
-  RECOVERY_DELAYS = {"released": 0.5, "light": 1.0, "firm": 3.0}
+  RECOVERY_DELAYS = {"released": 0.2, "aligned": 0.2, "light": 0.5, "firm": 1.5}
 
   def __init__(self):
     self.reset()
@@ -26,6 +27,7 @@ class TeslaSteeringPause:
     self.last_sample_time = None
     self.entry_since = None
     self.quiet_since = None
+    self.fast_since = None
     self.condition = None
     self.reason = "inactive"
 
@@ -51,7 +53,7 @@ class TeslaSteeringPause:
     signals = (CS.steeringTorque, CS.steeringRateDeg, CS.steeringAngleDeg, target_angle, sample_time)
     if not valid or not CS.canValid or CS.steerFaultTemporary or CS.steerFaultPermanent or not all(map(math.isfinite, signals)):
       self.paused = True
-      self.entry_since = self.quiet_since = self.condition = None
+      self.entry_since = self.quiet_since = self.fast_since = self.condition = None
       self.last_sample_time = None
       self.reason = "unavailable"
       return False
@@ -60,17 +62,18 @@ class TeslaSteeringPause:
       if sample_time <= self.last_sample_time:
         if sample_time < self.last_sample_time:
           self.paused = True
-          self.entry_since = self.quiet_since = self.condition = None
+          self.entry_since = self.quiet_since = self.fast_since = self.condition = None
           self.reason = "unavailable"
         return not self.paused
       if sample_time - self.last_sample_time > self.MAX_SAMPLE_GAP:
         self.paused = True
-        self.entry_since = self.quiet_since = self.condition = None
+        self.entry_since = self.quiet_since = self.fast_since = self.condition = None
     self.last_sample_time = sample_time
 
     torque = abs(CS.steeringTorque)
     moving_wheel = abs(CS.steeringRateDeg) >= self.STEERING_RATE
-    angle_disagreement = abs(CS.steeringAngleDeg - target_angle) >= self.ANGLE_DISAGREEMENT
+    angle_error = abs(CS.steeringAngleDeg - target_angle)
+    angle_disagreement = angle_error >= self.ANGLE_DISAGREEMENT
     strong_input = torque >= self.STRONG_TORQUE
 
     if not self.paused:
@@ -82,7 +85,7 @@ class TeslaSteeringPause:
         self.entry_since = None
       if strong_input or (self.entry_since is not None and sample_time - self.entry_since >= self.ENTRY_DELAY - 1e-9):
         self.paused = True
-        self.quiet_since = self.condition = None
+        self.quiet_since = self.fast_since = self.condition = None
         self.reason = "driver_input"
       return not self.paused
 
@@ -92,22 +95,35 @@ class TeslaSteeringPause:
     if torque <= self.RELEASE_TORQUE:
       condition = "released"
     elif strong_input or (torque >= self.HOLD_TORQUE and (moving_wheel or angle_disagreement)):
-      self.quiet_since = self.condition = None
+      self.quiet_since = self.fast_since = self.condition = None
       self.reason = "driver_input"
       return False
     else:
       condition = "light" if torque < self.PAUSE_TORQUE else "firm"
 
     if condition != self.condition:
-      self.condition = condition
       self.quiet_since = sample_time
-    self.reason = condition
-    if sample_time - self.quiet_since >= self.RECOVERY_DELAYS[condition] - 1e-9:
+      self.condition = condition
+
+    # A settled wheel agreeing with the live plan can hand back while held.
+    # Release and alignment share a continuous fast timer despite torque noise.
+    # Keep the ordinary contact timer independent: jitter across the alignment
+    # boundary must not repeatedly restart the longer light/firm recovery.
+    aligned = not moving_wheel and angle_error <= self.ALIGNMENT_ANGLE
+    fast_recovery = condition == "released" or aligned
+    if not fast_recovery:
+      self.fast_since = None
+    elif self.fast_since is None:
+      self.fast_since = sample_time
+    self.reason = "aligned" if aligned and condition != "released" else condition
+    fast_ready = self.fast_since is not None and sample_time - self.fast_since >= self.RECOVERY_DELAYS["aligned"] - 1e-9
+    quiet_ready = sample_time - self.quiet_since >= self.RECOVERY_DELAYS[condition] - 1e-9
+    if fast_ready or quiet_ready:
       if not resume_allowed:
         # Preserve the completed quiet period, but wait for an angle that the
         # existing actuator limits can accept without an abrupt absolute clamp.
         self.reason = "angle_limit"
         return False
       self.paused = False
-      self.entry_since = self.quiet_since = self.condition = None
+      self.entry_since = self.quiet_since = self.fast_since = self.condition = None
     return not self.paused
