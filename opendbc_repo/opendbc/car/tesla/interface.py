@@ -1,4 +1,5 @@
 from opendbc.car import Bus, get_safety_config, structs
+from opendbc.car.carlog import carlog
 from opendbc.car.interfaces import CarInterfaceBase
 from opendbc.car.tesla.carcontroller import CarController
 from opendbc.car.tesla.carstate import CarState
@@ -45,10 +46,28 @@ class CarInterface(CarInterfaceBase):
       ret.vEgoStarting = 0.1
       ret.stoppingDecelRate = 0.3
 
-    fsd_14 = any(fw.ecu == Ecu.eps and fw.fwVersion in FSD_14_FW.get(candidate, []) for fw in car_fw)
-    if fsd_14:
+    eps_encoding_match = any(fw.ecu == Ecu.eps and fw.fwVersion in FSD_14_FW.get(candidate, []) for fw in car_fw)
+    # Personal Model 3 is always cooperative. On newer firmware, the old 2-bit
+    # value 1 encodes 3-bit LANE_KEEP_ASSIST (010). Reuse the paired legacy FSD_14
+    # encoding flags; this does not assert that the car has FSD 14 installed.
+    # Fresh CAN evidence also works when the cached EPS version is old/missing.
+    # These exact buses/messages are upstream's 3-bit detector (opendbc PR #3802).
+    redundant_braking_seen = 0x489 in fingerprint[CANBUS.autopilot_party]
+    autonomy_health_seen = 0x054 in fingerprint[CANBUS.party]
+    model_3_3_bit_can = candidate == CAR.TESLA_MODEL_3 and (redundant_braking_seen or autonomy_health_seen)
+    if eps_encoding_match or model_3_3_bit_can:
       ret.flags |= TeslaFlags.FSD_14.value
       ret.safetyConfigs[0].safetyParam |= TeslaSafetyFlags.FSD_14.value
+
+    if candidate == CAR.TESLA_MODEL_3:
+      carlog.info({
+        "event": "tesla_steering_protocol",
+        "fingerprint": candidate,
+        "eps_encoding_match": eps_encoding_match,
+        "redundant_braking_on_bus_2": redundant_braking_seen,
+        "autonomy_health_on_bus_0": autonomy_health_seen,
+        "legacy_fsd14_encoding_flag": bool(ret.flags & TeslaFlags.FSD_14.value),
+      })
 
     ret.dashcamOnly = candidate in (CAR.TESLA_MODEL_X,)  # dashcam only, pending find invalidLkasSetting signal
 

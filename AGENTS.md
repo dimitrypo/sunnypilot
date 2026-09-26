@@ -190,7 +190,8 @@ silently removing their context.
   triggered full disengagement in both Python and Panda safety.
 - After: Model 3 initialization always selects cooperative mode, independent of
   the stored preference. The local Tesla settings UI displays it checked/locked.
-  FSD 14 mode mapping and the existing EPS restrictions remain in effect. A
+  The legacy encoding map and existing EPS restrictions remain in effect (see
+  TESLA-002 for improved detection). A
   temporary handover gates actual `CarControl.latActive`; engagement, longitudinal
   control, cruise cancellation, and driver-monitoring contact signals are not
   rewritten. The healthy main UI reflects steering unavailable as `long_only`.
@@ -287,18 +288,57 @@ on hardware; its source and prebuilt binaries are unchanged.
   the display. The force-on and refreshed UI remove these dependencies for the
   personal Model 3. AlwaysOffroad normally restarts the car process; do not claim
   it bypasses initialization.
-- Remaining hypotheses: exact EPS firmware identification and its FSD 14 mode
-  mapping, including reused `CarParamsCache` firmware; actual EPS acceptance and
-  operating conditions. The Tesla software release label alone does not establish
-  the EPS firmware string or correct mode. Do not flip FSD flags, add guessed
-  firmware matches, clear caches automatically, or bypass unknown-firmware guards.
+- Confirmed compatibility gap: upstream describes Tesla's steering mode growing
+  from two to three bits, including non-FSD releases. Without the legacy encoding
+  flag, our cooperative command can select FSD mode instead of lane keeping.
+  See [opendbc #3797](https://github.com/commaai/opendbc/pull/3797), merged as
+  `d2599bf817bdcfb5e032e0fa9a5468dc191ebebd` on 2026-09-19.
+- Upstream's replacement detector uses fresh CAN messages and identified cases
+  where cached firmware lagged the updated protocol. TESLA-002 adopts that
+  detection for this personal cooperative path. The software label `2026.27.300`
+  alone is not detection evidence. Do not add guessed firmware matches, clear
+  caches automatically, or remove the remaining unknown-firmware guard.
 - Startup log `tesla_cooperative_steering_config` records fingerprint, stored
-  preference, effective forced state, FSD 14 detection, and active CAN mode.
-  `tesla_steering_pause` records handover transitions and hard-override escalation.
+  preference, effective forced state, legacy encoding flag, and active CAN mode.
+  `tesla_steering_protocol` records CAN/EPS detection evidence.
+  `tesla_steering_pause` records handover, blocked recovery, and hard overrides.
   These record requested configuration/control state, not proof of EPS acceptance.
   To diagnose a recurrence, correlate logs with CarParams EPS firmware and live
   steering torque/angle, EPAS status/error/hands level, requested CAN mode, and
   vehicle speed. No real-device evidence has yet identified the user's root cause.
+
+### TESLA-002 - Detect modern steering encoding from live CAN
+
+- Request: investigate and address enabled cooperative steering that intermittently
+  refuses driver corrections; retain the Python-only scope.
+- Before: only known EPS firmware strings selected the existing encoding map.
+  Missing or cached strings could select an incompatible cooperative mode.
+- After: for `TESLA_MODEL_3`, either `0x489` on bus 2 or `0x054` on bus 0 also
+  selects the map. This matches the detector in
+  [opendbc #3802](https://github.com/commaai/opendbc/pull/3802), merged as
+  `594700b86cd03347c6650ecf14feb1b543b0d72a` on 2026-09-21. Existing EPS matches
+  remain a fallback; other platforms keep their original detection.
+- Scope: set existing `TeslaFlags.FSD_14` and `TeslaSafetyFlags.FSD_14` together.
+  Their names are historical, not proof of FSD software. With forced cooperative
+  mode, this maps logical mode 2 to old two-bit value 1: the emitted bits `010`
+  mean modern lane keeping, and `000` remains steering off. Both commands are
+  already supported by the prebuilt firmware. No DBC, safety source, binary,
+  longitudinal rule, hard override, or stock-Autosteer requirement changed.
+  This is deliberately not the complete upstream three-bit conversion.
+- Files: `opendbc_repo/opendbc/car/tesla/interface.py` and
+  `opendbc_repo/opendbc/sunnypilot/car/tesla/tests/test_steering_protocol.py`.
+- Commit subject: `fix: detect modern Tesla steering encoding from live CAN`.
+- Validation: 9 tests and 16 subtests passed, including the real CAN packer and
+  CarState, both markers, wrong buses, cached/missing EPS strings, legacy fallback,
+  other platforms, paired flags, stock-LKAS detection, and stock-Autosteer lockout.
+  Command: `docker exec sunnypilot-python-test python -m pytest --noconftest -c /dev/null -p no:cacheprovider -q opendbc_repo/opendbc/sunnypilot/car/tesla/tests/test_steering_protocol.py`.
+  Ruff and Git whitespace checks passed. Together with TESLA-001: 74 tests and
+  26 subtests passed. Device acceptance and the user's intermittent symptom remain
+  unverified; diagnostic logs are included for that follow-up.
+- Upstream maintenance: reassess/retire this supplement when a release adopts the
+  native three-bit DBC and matching prebuilt safety. Do not replay the legacy
+  mode mapping onto that new format. Revalidate cooperative lane-keeping support
+  against the new firmware before carrying over TESLA-001.
 
 ## Maintenance history
 
@@ -308,3 +348,6 @@ on hardware; its source and prebuilt binaries are unchanged.
 - 2026-09-26: implemented TESLA-001 as a Python-only personal change, retaining
   the same upstream base and the existing prebuilt safety firmware. Device
   installation and physical validation remain separate from the repository work.
+- 2026-09-26: added TESLA-002 based on upstream protocol evidence; retained the
+  existing wire format and firmware. Recorded the reported Tesla software version
+  and outstanding device verification instead of assuming a confirmed root cause.
