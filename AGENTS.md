@@ -351,3 +351,18 @@ on hardware; its source and prebuilt binaries are unchanged.
 - 2026-09-26: added TESLA-002 based on upstream protocol evidence; retained the
   existing wire format and firmware. Recorded the reported Tesla software version
   and outstanding device verification instead of assuming a confirmed root cause.
+- 2026-09-26: user authorized publishing the personal commits to
+  `origin/release-mici` for installation on the comma 4. Runtime commits are
+  `e6dc91b` (TESLA-001) and `49f2931` (TESLA-002); these are publication-era
+  references, not stable IDs after a future replay. No runtime changes were added
+  during publication; the recorded 74 tests and 26 subtests remain applicable.
+  The exact fork installer URL returned HTTP 200. Read-only inspection of its
+  ARM64 installer confirmed `https://github.com/dimitrypo/sunnypilot.git`,
+  `git checkout release-mici`, and `git reset --hard origin/release-mici`:
+  it selects the published branch tip, not a pinned older release. The launcher
+  sets PYTHONPATH to that checkout; card, controlsd, and UI are Python processes,
+  so these source changes are used with the retained prebuilt artifacts. Normal
+  updates fetch the configured origin. Uninstall/Custom Software installation
+  through the recorded URL is the intended first-install path. Remote publication
+  must be checked against GitHub after pushing; device installation and driving
+  behavior still require separate verification.
