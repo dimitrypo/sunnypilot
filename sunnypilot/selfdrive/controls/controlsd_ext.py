@@ -4,12 +4,17 @@ Copyright (c) 2021-, Haibin Wen, sunnypilot, and a number of other contributors.
 This file is part of sunnypilot and is licensed under the MIT License.
 See the LICENSE.md file in the root directory for more details.
 """
+import math
 import time
 
 import cereal.messaging as messaging
 from cereal import log, custom
 
 from opendbc.car import structs
+from opendbc.car.lateral import get_max_angle_vm
+from opendbc.car.tesla.carcontroller import get_safety_CP
+from opendbc.car.tesla.values import CarControllerParams
+from opendbc.car.vehicle_model import VehicleModel
 from openpilot.common.params import Params
 from openpilot.common.swaglog import cloudlog
 from openpilot.sunnypilot import PARAMS_UPDATE_PERIOD
@@ -17,6 +22,7 @@ from openpilot.sunnypilot.livedelay.helpers import get_lat_delay
 from openpilot.sunnypilot.modeld_v2.modeld_base import ModelStateBase
 from openpilot.sunnypilot.selfdrive.controls.lib.blinker_pause_lateral import BlinkerPauseLateral
 from openpilot.sunnypilot.selfdrive.controls.lib.latcontrol_torque_v0 import LatControlTorque as LatControlTorqueV0
+from openpilot.sunnypilot.selfdrive.controls.lib.tesla_steering_pause import TeslaSteeringPause
 
 
 class ControlsExt(ModelStateBase):
@@ -26,6 +32,8 @@ class ControlsExt(ModelStateBase):
     self.params = params
     self._param_update_time: float = 0.0
     self.blinker_pause_lateral = BlinkerPauseLateral()
+    self.tesla_steering_pause = TeslaSteeringPause() if CP.carFingerprint == "TESLA_MODEL_3" else None
+    self.tesla_safety_vm = VehicleModel(get_safety_CP()) if self.tesla_steering_pause is not None else None
 
     cloudlog.info("controlsd_ext is waiting for CarParamsSP")
     self.CP_SP = messaging.log_from_bytes(params.get("CarParamsSP", block=True), custom.CarParamsSP)
@@ -60,12 +68,57 @@ class ControlsExt(ModelStateBase):
     if self.blinker_pause_lateral.update(sm['carState']):
       return False
 
+    return self.get_lat_requested(sm)
+
+  @staticmethod
+  def get_lat_requested(sm: messaging.SubMaster) -> bool:
     ss_sp = sm['selfdriveStateSP']
     if ss_sp.mads.available:
       return bool(ss_sp.mads.active)
 
     # MADS not available, use stock state to engage
     return bool(sm['selfdriveState'].active)
+
+  def apply_tesla_steering_pause(self, sm: messaging.SubMaster, lat_active: bool, planned_curvature: float) -> bool:
+    if self.tesla_steering_pause is None:
+      return lat_active
+
+    CS = sm['carState']
+    lp = sm['liveParameters']
+    # Use the live planner target, NOT the actuator output/current curvature that
+    # deliberately tracks the measured wheel angle while lateral control is off.
+    target_angle = math.degrees(self.VM.get_steer_from_curvature(-planned_curvature, CS.vEgo, lp.roll)) + lp.angleOffsetDeg
+    plan_service = 'lateralManeuverPlan' if sm.valid['lateralManeuverPlan'] else 'modelV2'
+    valid = sm.all_checks(['carState', 'liveParameters', plan_service]) and math.isfinite(CS.vEgoRaw)
+    paused_before = self.tesla_steering_pause.paused
+    hard_disengaged_before = self.tesla_steering_pause.hard_disengaged
+    reason_before = self.tesla_steering_pause.reason
+    resume_allowed = False
+    if valid and math.isfinite(CS.steeringAngleDeg) and sm.all_checks(['carOutput']):
+      # CarController clips the absolute angle AFTER its rate limiter. Outside
+      # that envelope, automatic re-entry could request a large angle step that
+      # Panda rejects. Wait for the wheel to enter the existing envelope instead.
+      max_angle = min(get_max_angle_vm(max(CS.vEgoRaw, 1), self.tesla_safety_vm, CarControllerParams),
+                      CarControllerParams.ANGLE_LIMITS.STEER_ANGLE_MAX)
+      # The 50 Hz command can trail the 100 Hz measured angle by one frame.
+      # Ensure the last applied inactive angle has entered the envelope too.
+      applied_angle = sm['carOutput'].actuatorsOutput.steeringAngleDeg
+      resume_allowed = (math.isfinite(max_angle) and math.isfinite(applied_angle) and
+                        max(abs(CS.steeringAngleDeg), abs(applied_angle)) <= max_angle)
+    active = self.tesla_steering_pause.update(
+      # Fault/standstill/blinker gates must not erase an existing handover or hard
+      # override latch. Only the upstream engagement state can reset it.
+      CS, requested_active=self.get_lat_requested(sm), target_angle=target_angle,
+      sample_time=sm.logMonoTime['carState'] * 1e-9, valid=valid, resume_allowed=resume_allowed,
+    )
+    if (self.tesla_steering_pause.paused != paused_before or
+        self.tesla_steering_pause.hard_disengaged != hard_disengaged_before or
+        (self.tesla_steering_pause.reason != reason_before and "angle_limit" in (reason_before, self.tesla_steering_pause.reason))):
+      cloudlog.event("tesla_steering_pause", paused=self.tesla_steering_pause.paused,
+                     reason=self.tesla_steering_pause.reason,
+                     torque_nm=CS.steeringTorque if math.isfinite(CS.steeringTorque) else None,
+                     angle_error_deg=CS.steeringAngleDeg - target_angle if math.isfinite(CS.steeringAngleDeg - target_angle) else None)
+    return lat_active and active
 
   @staticmethod
   def get_lead_data(_lead, src: log.RadarState.LeadData) -> None:

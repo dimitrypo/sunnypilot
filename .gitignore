@@ -1,5 +1,7 @@
 venv/
 .venv/
+docker-compose.override.yml
+docker-compose.override.yaml
 .ci_cache
 .env
 .clang-format

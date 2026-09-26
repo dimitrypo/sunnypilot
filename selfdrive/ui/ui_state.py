@@ -14,6 +14,7 @@ from openpilot.system.ui.lib.application import gui_app
 from openpilot.system.hardware import HARDWARE, PC
 
 from openpilot.selfdrive.ui.sunnypilot.ui_state import UIStateSP, DeviceSP
+from openpilot.selfdrive.ui.sunnypilot.tesla_status import tesla_steering_pause_status
 
 BACKLIGHT_OFFROAD = 65 if HARDWARE.get_device_type() == "mici" else 50
 PARAM_UPDATE_TIME = 1 / 5.0
@@ -177,6 +178,11 @@ class UIState(UIStateSP):
         self.status = UIStatus.ENGAGED if ss.enabled else UIStatus.DISENGAGED
 
       self.status = UIStatus(UIStateSP.update_status(ss, self.sm["selfdriveStateSP"], self.sm["onroadEvents"]))
+      self.status = UIStatus(tesla_steering_pause_status(
+        self.status.value, self.CP.carFingerprint if self.CP is not None else None,
+        self.sm["carState"], self.sm["carControl"],
+        self.sm.all_checks(["carState", "carControl"]) and self.sm.recv_frame["carControl"] > self.started_frame,
+      ))
 
     # Check for engagement state changes
     if self.engaged != self._engaged_prev:

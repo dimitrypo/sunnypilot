@@ -11,8 +11,11 @@ from collections.abc import Callable
 
 from opendbc.car import structs
 from opendbc.car.can_definitions import CanRecvCallable, CanSendCallable
+from opendbc.car.carlog import carlog
 from opendbc.car.hyundai.values import HyundaiFlags
 from opendbc.car.subaru.values import SubaruFlags
+from opendbc.car.tesla.teslacan import get_steer_ctrl_type
+from opendbc.car.tesla.values import CAR as TESLA, TeslaFlags
 from opendbc.car.toyota.values import ToyotaSafetyFlags
 from opendbc.sunnypilot.car.hyundai.enable_radar_tracks import enable_radar_tracks as hyundai_enable_radar_tracks
 from opendbc.sunnypilot.car.hyundai.longitudinal.helpers import LongitudinalTuningType
@@ -107,9 +110,23 @@ def _initialize_custom_longitudinal_tuning(CI, CP: structs.CarParams, CP_SP: str
 def _initialize_coop_steering(CP: structs.CarParams, CP_SP: structs.CarParamsSP,
                               params_dict: dict[str, str]) -> None:
   if CP.brand == 'tesla':
-    coop_steering = int(params_dict.get("TeslaCoopSteering", 0)) == 1
+    # Personal Model 3 install: cooperative steering must not depend on a saved
+    # toggle captured before fingerprinting, or on a later settings restore.
+    forced_coop_steering = CP.carFingerprint == TESLA.TESLA_MODEL_3
+    stored_coop_steering = params_dict.get("TeslaCoopSteering", 0)
+    coop_steering = forced_coop_steering or int(stored_coop_steering) == 1
     if coop_steering:
       CP_SP.flags |= TeslaFlagsSP.COOP_STEERING.value
+    effective_coop_steering = bool(CP_SP.flags & TeslaFlagsSP.COOP_STEERING.value)
+    carlog.info({
+      "event": "tesla_cooperative_steering_config",
+      "fingerprint": CP.carFingerprint,
+      "stored_preference": stored_coop_steering,
+      "forced_for_personal_model_3": forced_coop_steering,
+      "effective_cooperative": effective_coop_steering,
+      "fsd_14": bool(CP.flags & TeslaFlags.FSD_14.value),
+      "active_can_control_type": get_steer_ctrl_type(CP.flags, 2 if effective_coop_steering else 1),
+    })
 
 
 def _initialize_radar_tracks(CP: structs.CarParams, CP_SP: structs.CarParamsSP,

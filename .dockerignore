@@ -1,4 +1,23 @@
 **/.git
+# Keep host agent instructions and configuration out of local test images.
+.cursor/
+.claude/
+.vscode/
+.codex/
+.agents/
+.aider/
+.continue/
+.windsurf/
+.mcp.json
+AGENTS.md
+CLAUDE.md
+GEMINI.md
+.cursorrules
+.clinerules
+.windsurfrules
+.roomodes
+.env
+.env.*
 .DS_Store
 *.dylib
 *.DSYM

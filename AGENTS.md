@@ -22,6 +22,11 @@ preserve its binaries, models, firmware, and `prebuilt` marker. Changes requirin
 compilation or different dependencies need a separately established build plan;
 pushing source changes alone does not produce new compiled artifacts.
 
+This is a personal installation used only on Dmitry's Tesla Model 3 Highland.
+Compatibility with other owners' workflows is not a requirement. The software
+uses the shared `TESLA_MODEL_3` fingerprint for Highland and older Model 3s; do
+not claim the personal behavior has a separate Highland-only detection rule.
+
 ## Start every task
 
 1. Read this file, including the current base and change register below.
@@ -170,10 +175,136 @@ install, restart, or operate the device as part of a repository-only task.
 For each subsequent change, add a stable ID with its request, before/after
 behavior, files, commit subject(s), validation and limitations, and upstream
 conflict considerations. Mark retired changes with the reason instead of
-silently removing their context. There are currently no personal runtime changes.
+silently removing their context.
+
+### TESLA-001 - Forced cooperative steering and temporary driver handover
+
+- Request: preserve cooperative steering for small corrections; temporarily yield
+  steering for larger ordinary corrections, keep speed control active, and resume
+  automatically after input settles. A hard override must still fully disengage.
+  The user explicitly chose the Python-only approximation, retaining the current
+  firmware cutoff. This is not a request to reproduce FrogTesla's firmware policy.
+- Before: the saved `TeslaCoopSteering` value was captured at car initialization,
+  the UI could show a different/stale value, and no soft pause/recovery state
+  machine existed. Tesla hands-on level 3 or the high-angle-rate safety fault
+  triggered full disengagement in both Python and Panda safety.
+- After: Model 3 initialization always selects cooperative mode, independent of
+  the stored preference. The local Tesla settings UI displays it checked/locked.
+  FSD 14 mode mapping and the existing EPS restrictions remain in effect. A
+  temporary handover gates actual `CarControl.latActive`; engagement, longitudinal
+  control, cruise cancellation, and driver-monitoring contact signals are not
+  rewritten. The healthy main UI reflects steering unavailable as `long_only`.
+- Entry: at least 0.8 Nm of torque plus wheel motion of at least 5 degrees/s or
+  planner-angle disagreement of at least 3 degrees, sustained for 0.05 seconds.
+  At least 1.5 Nm yields immediately. These are initial, uncalibrated thresholds
+  in `TeslaSteeringPause`, not measured guarantees about this vehicle.
+- While paused: at least 0.3 Nm with continuing movement/angle disagreement keeps
+  the pause, including a stationary wheel holding an offset; at least 1.5 Nm also
+  keeps it paused. Otherwise, continuous torque at or below 0.2 Nm resumes after
+  0.5 seconds, light input below 0.8 Nm after 1 second, and firm settled input
+  after 3 seconds. A change of input category starts its own quiet period. A clear
+  release takes the 0.5-second path even after a firm hold or with residual angle
+  disagreement. Renewed correction resets recovery.
+- Signals: torque, wheel angle/rate, and an independent live planner target.
+  No physical hand-contact/count sensor is available to this helper. Raw Tesla
+  `hands_on_level` is not in the published CarState schema; the firmware still
+  reads it independently. A relaxed hold can resemble release after EPS yields.
+- Integration: the lateral controller resets/tracks actual steering while paused;
+  return goes through existing curvature and angle/rate limits. Automatic recovery
+  also waits until measured steering and the fresh reported last actuator angle
+  are inside the existing Tesla angle envelope at the current raw speed, using
+  the same fixed Model Y safety vehicle model as CarController. Checking both
+  angles covers the different controls/CAN update rates. The existing limiter
+  clips absolute angle after rate limiting; without this guard, re-entry from
+  outside that envelope could request an abrupt
+  step. Quiet time still accumulates while waiting for the angle to become valid.
+  Duplicate carState samples cannot advance recovery; invalid/stale carState or
+  planner data resets its quiet timer. Temporary actuator gates do not
+  erase the handover/hard-override latch; reset follows upstream engagement.
+  `publish()` uses the computed `CC.latActive`, avoiding a second update of the
+  blinker timer during one controls cycle (also corrects that all-platform timer
+  double update). No CAN schema, safety policy, firmware, or binaries changed.
+- Limits: early yielding may avoid the hard cutoff, but slow force can still
+  reach hands-on level 3 and fully disengage. A timed pause must never re-enable
+  a fully disengaged system. The 0.5-second delay is a signal-based recovery
+  target, not proof of hands-off or a guarantee against lane departure. Faults or
+  an angle outside the existing envelope can delay recovery beyond that timer,
+  potentially indefinitely until the condition clears.
+- Files: `opendbc_repo/opendbc/sunnypilot/car/interfaces.py`,
+  `selfdrive/ui/sunnypilot/layouts/settings/vehicle/brands/tesla.py`,
+  `sunnypilot/selfdrive/controls/lib/tesla_steering_pause.py`,
+  `sunnypilot/selfdrive/controls/controlsd_ext.py`, `selfdrive/controls/controlsd.py`,
+  `selfdrive/ui/ui_state.py`, `selfdrive/ui/sunnypilot/tesla_status.py`, and their
+  focused tests. Container ignore files protect local test configuration.
+- Commit subject: `feat: add personal Model 3 cooperative steering handover`.
+- Validation: 65 tests and 10 subtests passed across state-machine, integration,
+  cooperative-mode and UI tests,
+  existing Tesla vehicle and blinker tests, Ruff on changed Python files, and Git
+  whitespace checks passed. Actual-controller integration covers retained speed
+  control, measured-angle tracking, timed recovery, hard overrides across faults,
+  and blocking recovery beyond the existing angle envelope. Used isolated Python
+  3.12 with dependencies pinned from `uv.lock`, read-only
+  repository mount, masked `AGENTS.md`/`.vscode`/`.git`, and temporary dependency
+  storage. No host dependency installation. No vehicle, real-route replay, or
+  physical handover validation has been performed.
+- Upstream maintenance: retain Tesla firmware detection, independent hard
+  overrides, and controller limits; reconcile upstream changes to `latActive`,
+  MADS, planner target selection, timestamps, and UI status carefully. A broader
+  firmware change needs its own scope and build plan.
+
+Focused test command in the hardened `sunnypilot-python-test` container (dependency
+directory `/deps`, `PYTHONPATH=/deps:/repo`, repository mounted read-only at `/repo`):
+
+```sh
+docker exec -e PARAMS_ROOT=/tmp/tesla-test-params sunnypilot-python-test python -m pytest \
+  --noconftest -c /dev/null -p no:cacheprovider -q \
+  sunnypilot/selfdrive/controls/lib/tests/test_tesla_steering_pause.py \
+  sunnypilot/selfdrive/controls/lib/tests/test_tesla_steering_pause_integration.py \
+  selfdrive/ui/tests/test_tesla_status.py \
+  opendbc_repo/opendbc/sunnypilot/car/tesla/tests/test_coop_steering.py \
+  opendbc_repo/opendbc/car/tesla/tests/test_tesla.py \
+  sunnypilot/selfdrive/controls/lib/tests/test_blinker_pause_lateral.py
+```
+
+`--noconftest` isolates these tests from the unrelated full-manager startup fixture;
+it does not replace their tested controllers. `PARAMS_ROOT` keeps the blinker
+tests' temporary settings off the read-only root filesystem. Ruff command:
+`docker exec sunnypilot-python-test python -m ruff check --no-cache PATHS`, with
+`PATHS` expanded to every changed/new Python file. Whitespace: `git diff --check`
+and `git diff --cached --check`. These local tests do not validate Panda firmware
+on hardware; its source and prebuilt binaries are unchanged.
+
+#### Intermittent cooperative steering investigation
+
+- User reports blocked corrections at approximately 30-60 km/h, sometimes fixed
+  by toggling/restarting or apparently by itself; Tesla software `2026.27.300`.
+  This is a reported symptom, not a reproduced fault. The documented minimum of
+  23 km/h cannot by itself explain the reported speed range.
+- Confirmed source behavior: `selfdrive/car/card.py` captures settings before
+  fingerprinting; the running controller uses that initialized `CP_SP` flag.
+  `ToggleSP` originally read its displayed state only at widget construction.
+  Later settings restores/remote changes can therefore disagree with runtime or
+  the display. The force-on and refreshed UI remove these dependencies for the
+  personal Model 3. AlwaysOffroad normally restarts the car process; do not claim
+  it bypasses initialization.
+- Remaining hypotheses: exact EPS firmware identification and its FSD 14 mode
+  mapping, including reused `CarParamsCache` firmware; actual EPS acceptance and
+  operating conditions. The Tesla software release label alone does not establish
+  the EPS firmware string or correct mode. Do not flip FSD flags, add guessed
+  firmware matches, clear caches automatically, or bypass unknown-firmware guards.
+- Startup log `tesla_cooperative_steering_config` records fingerprint, stored
+  preference, effective forced state, FSD 14 detection, and active CAN mode.
+  `tesla_steering_pause` records handover transitions and hard-override escalation.
+  These record requested configuration/control state, not proof of EPS acceptance.
+  To diagnose a recurrence, correlate logs with CarParams EPS firmware and live
+  steering torque/angle, EPAS status/error/hands level, requested CAN mode, and
+  vehicle speed. No real-device evidence has yet identified the user's root cause.
 
 ## Maintenance history
 
 - 2026-09-26: established this workflow on base
   `6a17f75c6bcb67c85f252a1acc342d94d5b8a4d2`; no upstream integration or device
   modification performed.
+- 2026-09-26: implemented TESLA-001 as a Python-only personal change, retaining
+  the same upstream base and the existing prebuilt safety firmware. Device
+  installation and physical validation remain separate from the repository work.
