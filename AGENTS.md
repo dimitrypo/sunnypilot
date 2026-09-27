@@ -542,6 +542,79 @@ on hardware; its source and prebuilt binaries are unchanged.
   review; no repository code executed, runtime edits, device operations, or new
   firmware. Only this context record changed; no update was pushed.
 
+### INVESTIGATION-002 - Steering override policy, firmware delivery and rollback
+
+- Request (2026-09-27): after approximately 15 minutes of satisfactory operation,
+  assess keeping speed control engaged during hard steering/roundabouts, with
+  steering paused during driver input. The user proposes removing steering-based
+  full disengagement entirely and asks whether this simplifies implementation,
+  its risk, and whether firmware updates and rollback require reinstalling.
+  This task is an assessment, not authorization to implement or publish firmware.
+- Current triggers: both `opendbc_repo/opendbc/car/tesla/carstate.py:70-73` and
+  `opendbc_repo/opendbc/safety/modes/tesla.h:136-141` combine hands-on level >=3
+  with EAC_INHIBITED/high-angle-rate safety error. The Python result becomes a
+  user-disable event; the firmware result feeds Panda's full-disengagement path
+  and MADS. `carcontroller.py:35-45` independently inhibits steering at level 3.
+  `TeslaSteeringPause` also latches the hard event. A Python-only removal cannot
+  retain engagement against the existing firmware. A steering-output inhibit
+  should remain even if a future policy preserves longitudinal engagement.
+- Distinction: level 3 classifies driver force; high-angle-rate error is an EPS
+  safety fault and also sets `steerFaultTemporary`, independently gating lateral
+  output. Removing its full-disengagement event cannot make Tesla accept steering
+  through inhibition. No route/CAN capture establishes which signal causes this
+  user's hard-turn/roundabout disengagement. Low override resistance and brief
+  satisfactory driving are not emergency-maneuver or fault validation.
+- Risk: retaining speed control through an evasive maneuver can retain unwanted
+  acceleration/speed. TESLA-004's immediate +/-1-degree recovery can request
+  steering again as the wheel crosses the planner target under active force.
+  Removing the current hard override exposes that interaction during a wider
+  range of maneuvers; gentle command limits do not resolve the policy conflict.
+  Brake/cancel, driver monitoring, CAN validity, heartbeat, actuator limits and
+  real faults must remain effective. Do not describe brake as the sole exit.
+- Recommendation: first identify the actual trigger from EPAS level/status/error
+  and disengagement events. Consider only a coordinated level-3 lateral pause
+  with speed retained, preserving high-angle-rate fault full disengagement and
+  independent steering inhibition. Review strong-input priority over aligned
+  recovery before extending it to hard overrides. This would change the user's
+  previous alignment preference and must be resolved explicitly before coding.
+  Literal removal of every steering-triggered disengagement is not recommended;
+  fewer conditionals do not make the resulting policy safer or better validated.
+- Effort: moderate coordinated C/Python source work; substantially greater build
+  and validation work than the previous timer changes. Budget engineering days,
+  not a quick threshold edit, for a compatible firmware build, full safety tests
+  with new coverage, Python regressions, image verification and suitable replay.
+  Controlled hardware/vehicle validation and rollback checks remain separate;
+  no reliable road-ready delivery estimate is possible before identifying the
+  trigger and establishing the build and validation setup. No build was attempted.
+- Delivery: firmware here means the comma's Panda CAN safety microcontroller,
+  not Tesla EPS firmware. This release tracks `panda/board/obj/panda_h7.bin.signed`
+  and skips compilation with `prebuilt`. A firmware change therefore needs a
+  compatible compiled/signed H7 image included with the matching Python change;
+  C source alone has no device effect. `selfdrive/pandad/pandad.py:18-58` compares
+  the installed image signature to the checkout's image, flashes on mismatch,
+  and verifies it before starting C++ pandad. `panda.cc:116-126` also compares
+  the image from disk, not a baked-in expected signature. Retain the existing
+  host protocol/bootstub where compatible; debug-key/bootstub acceptance and
+  build provenance require verification before shipping a custom image.
+- Rollback: the normal updater fetches and stages a complete branch commit.
+  A new forward revert commit restoring both known-good Python and the original
+  signed H7 binary should restore both through the normal parked update/reboot
+  path, provided startup/updater/flashing remain functional. The flasher checks
+  image signatures, not increasing release dates; the bootstub checks signature
+  and a minimum image format version. Keep the original image and commit. The
+  launcher's `old_openpilot` staging copy is deleted at subsequent updater setup,
+  so it is not a dependable rollback feature. Uninstall alone does not restore
+  MCU firmware; the replacement installation must run its flasher. Broken UI or
+  startup may require reinstall; failed Panda flashing can require bootstub/DFU
+  recovery. Neither path is guaranteed by this source review.
+- Evidence/validation: read-only code review and independent safety/update
+  reviews, plus current [comma safety documentation](https://docs.comma.ai/SAFETY/)
+  and [Panda recovery documentation](https://github.com/commaai/panda/blob/master/board/README.md).
+  The safety policy requires retained actuation limits/driver monitoring and a
+  passing full safety test suite with added coverage for changes. Documentation
+  and Git whitespace checks only; no runtime edits, tests, builds, flashes,
+  device operations, or push. Existing local Autopark documentation is preserved.
+
 ### INSTALL-001 - Repair comma 4 installer repository alias
 
 - Request: resolve "No custom software found at this URL" from the recorded fork
@@ -636,3 +709,7 @@ on hardware; its source and prebuilt binaries are unchanged.
   Implemented TESLA-004 with fresh EPS release evidence on the same upstream base;
   143 tests and 26 subtests passed. Publishing to the existing `release-mici`
   update branch is authorized; physical verification of this revision is pending.
+- 2026-09-27: recorded INVESTIGATION-002 on hard-steering disengagement, firmware
+  delivery and rollback. Recommended identifying the trigger and preserving real
+  EPS fault disengagement before considering a narrower force-override policy.
+  Assessment/documentation only; published driving code and firmware unchanged.
