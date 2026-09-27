@@ -886,7 +886,8 @@ class SafetyTest(SafetyTestBase):
       for attr in dir(test):
         if attr.startswith("Test") and attr != current_test:
           tc = getattr(test, attr)
-          tx = tc.TX_MSGS
+          # Build/ignition/policy fixtures need not expose vehicle TX metadata.
+          tx = getattr(tc, "TX_MSGS", None)
           if tx is not None and not attr.endswith('Base'):
             # No point in comparing different Tesla safety modes
             if 'Tesla' in attr and 'Tesla' in current_test:

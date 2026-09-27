@@ -18,6 +18,11 @@ class TeslaHandsOnMonitor:
     self.last_sample_nanos = None
     self.last_now_nanos = None
     self.zero_since_nanos = None
+    self.hands_on_level = None
+
+  def invalidate(self):
+    self.zero_since_nanos = None
+    self.hands_on_level = None
 
   def update(self, can_messages: list[bytes], now_nanos: int) -> float | None:
     """Return the current zero-level interval's start, in monotonic seconds.
@@ -28,7 +33,7 @@ class TeslaHandsOnMonitor:
     The EPS signal estimates driver input; it does not prove physical contact.
     """
     if now_nanos <= 0 or (self.last_now_nanos is not None and now_nanos < self.last_now_nanos):
-      self.zero_since_nanos = None
+      self.invalidate()
       return None
     self.last_now_nanos = now_nanos
 
@@ -36,7 +41,7 @@ class TeslaHandsOnMonitor:
       try:
         with log.Event.from_bytes(raw) as event:
           if not event.valid or event.which() != "can":
-            self.zero_since_nanos = None
+            self.invalidate()
             continue
 
           frames = [(frame.address, frame.dat, frame.src) for frame in event.can
@@ -47,7 +52,7 @@ class TeslaHandsOnMonitor:
           timestamp = event.logMonoTime
           if (timestamp <= 0 or timestamp > now_nanos or now_nanos - timestamp > self.MAX_GAP_NANOS or
               (self.last_sample_nanos is not None and timestamp <= self.last_sample_nanos)):
-            self.zero_since_nanos = None
+            self.invalidate()
             continue
           if self.last_sample_nanos is None or timestamp - self.last_sample_nanos > self.MAX_GAP_NANOS:
             self.zero_since_nanos = None
@@ -57,18 +62,20 @@ class TeslaHandsOnMonitor:
           # a nonzero level between two zero readings still starts a new interval.
           for frame in frames:
             if len(frame[1]) != 8:
-              self.zero_since_nanos = None
+              self.invalidate()
               continue
             updated = self.parser.update([(timestamp, [frame])])
             if self.ADDRESS not in updated or not self.parser.can_valid:
-              self.zero_since_nanos = None
-            elif self.parser.vl[self.MESSAGE][self.SIGNAL] != 0:
-              self.zero_since_nanos = None
-            elif self.zero_since_nanos is None:
-              self.zero_since_nanos = timestamp
+              self.invalidate()
+            else:
+              self.hands_on_level = int(self.parser.vl[self.MESSAGE][self.SIGNAL])
+              if self.hands_on_level != 0:
+                self.zero_since_nanos = None
+              elif self.zero_since_nanos is None:
+                self.zero_since_nanos = timestamp
       except (capnp.KjException, ValueError):
-        self.zero_since_nanos = None
+        self.invalidate()
 
     if self.last_sample_nanos is None or now_nanos - self.last_sample_nanos > self.MAX_GAP_NANOS:
-      self.zero_since_nanos = None
+      self.invalidate()
     return self.zero_since_nanos * 1e-9 if self.zero_since_nanos is not None else None

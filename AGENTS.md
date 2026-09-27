@@ -22,10 +22,11 @@ resolve conflicts, validate, and push the result to the fork.
   repository. The unused FrogTesla repository is now `dimitrypo/legacy_openpilot`.
   Preserve this alias: do not create or rename another repository to `openpilot`.
 
-The intended code changes are Python only. This is a prebuilt release tree:
-preserve its binaries, models, firmware, and `prebuilt` marker. Changes requiring
-compilation or different dependencies need a separately established build plan;
-pushing source changes alone does not produce new compiled artifacts.
+This is a prebuilt release tree. Most personal changes are Python only; TESLA-005
+is the explicitly authorized exception for Panda steering-override policy and its
+matching signed H7 application image. Preserve unrelated binaries, models, the
+bootstub, and the `prebuilt` marker. Any further compiled/dependency changes need
+an established build plan; pushing C source alone cannot update the firmware.
 
 This is a personal installation used only on Dmitry's Tesla Model 3 Highland.
 Compatibility with other owners' workflows is not a requirement. The software
@@ -184,6 +185,9 @@ silently removing their context.
 
 ### TESLA-001 - Forced cooperative steering and temporary driver handover
 
+- Current exception: TESLA-005 replaces highest-hands-level full disengagement
+  with an independently enforced steering pause; high-angle-rate safety faults
+  still fully disengage. Earlier Python-only validation below is historical.
 - Request: preserve cooperative steering for small corrections; temporarily yield
   steering for larger ordinary corrections, keep speed control active, and resume
   automatically after input settles. A hard override must still fully disengage.
@@ -419,6 +423,9 @@ on hardware; its source and prebuilt binaries are unchanged.
 
 ### TESLA-004 - Immediate aligned handback and EPS-assisted release
 
+- Current exception: TESLA-005 gives EPS hands-on level 3 priority over aligned
+  recovery and requires fresh EPS level evidence while the CAN monitor is active.
+  Lower levels retain the recovery behavior documented here.
 - Request: the user reports TESLA-003 is substantially better, but releasing the
   wheel can still feel like a 1.5-second wait. Resume immediately within +/-1
   degree even with strong input or active steering. Outside alignment, keep firm
@@ -495,6 +502,100 @@ on hardware; its source and prebuilt binaries are unchanged.
   changes, the independent planner angle, alignment priority, EPS classification
   latency, and the hard/fault/envelope guards during future upstream integration.
   Reassess the separate CAN subscription if upstream publishes this raw signal.
+
+### TESLA-005 - Highest hands-on level pauses steering without cancelling ACC
+
+- Request (2026-09-27): user explicitly authorized replacing only highest EPS
+  hands-on-level cancellation with a steering pause. Retain the existing
+  high-angle-rate safety-fault full disengagement and the current lower-level
+  pause/recovery behavior. User intends controlled vehicle testing before road
+  use. This supersedes the earlier Python-only scope for this specific change.
+- Before: level 3 or EAC_INHIBITED with HIGH_ANGLE_RATE_SAFETY caused full
+  cancellation independently in CarState and Panda; the controller also disabled
+  steering at level 3. TESLA-004 supplied lower-force pause/recovery.
+- After: paired `TeslaFlags.STEERING_PAUSE` and `TeslaSafetyFlags.STEERING_PAUSE`
+  (both value 8) are set only for the personal `TESLA_MODEL_3` fingerprint.
+  With this flag, level 3 no longer emits the full-disengagement event or revokes
+  Panda longitudinal permission. Unflagged vehicles retain the original policy.
+  The high-angle-rate EPS fault retains its full cutoff and hard latch. Other
+  faults, brake/cancel, driver monitoring, longitudinal/steering limits, stock AEB,
+  Autopark forwarding rules, and CAN/heartbeat checks are unchanged.
+- Steering is still inhibited at level 3 in three places: the controls pause
+  state (including UI/controller reset), the unchanged Tesla CarController
+  hands-level gate, and a new independent Panda TX guard. The firmware rejects
+  enabled angle/LKAS requests at level 3, permits valid inactive requests tracking
+  measured angle, and never advances accepted-angle history for a rejected active
+  request. Longitudinal commands remain subject to all their existing limits.
+  The guard starts inhibited until valid EPAS evidence and rejects active steering
+  when the latest valid EPAS sample is older than 100 ms, including with MADS.
+- Recovery: the read-only CAN monitor now exposes a fresh level or None. Missing,
+  invalid or stale evidence pauses lateral control; it cannot establish release.
+  Level 3 outranks +/-1-degree alignment even on a duplicate carState sample.
+  Clearing it cannot resume on a duplicate sample. After a valid lower level and
+  fresh control data, the previous immediate alignment / 0.2-second release /
+  0.5-second settled-light rules apply, subject to the unchanged angle envelope.
+  No automatic timeout is added for continued firm input. The EPS signal remains
+  a filtered activity estimate, not a physical contact sensor. The diagnostics
+  now include the decoded EPS hands-on level.
+- Build/delivery: built baseline and changed H7 applications in an isolated
+  Linux cross-compiler environment, ran Python and complete native safety tests,
+  verified the signed image against the same debug public key as the shipped
+  image, and preserved the shipped bootstub and host protocol definitions. Only
+  the changed H7 application image is included with the source patch. The prebuilt device
+  uses its existing startup signature comparison/flasher; no OS update is needed.
+  Rebuilt upstream source is not claimed to be byte-identical to the shipped
+  image when compiler/version metadata differ. See
+  [build provenance and rollback](docs/firmware/tesla-005/BUILD.md), with the
+  actual Dockerfile and pinned Python dependency manifest alongside it.
+  No physical flashing or vehicle test was performed by agents.
+- Rollback baseline: local branch
+  `backup/release-mici-before-level3-pause-20260927` at
+  `2141791` preserves all earlier personal behavior and documentation. Its H7 app
+  SHA256 is `1aa3cdbf797cd2f9324c08344685996065f5518bca3bc7640a83670c002ea703`;
+  bootstub SHA256 is
+  `2e64a697c3e15bf2a85067b3dd0e8800853c650e44918d165f7861bddb63209e`.
+  Restore this change's Python/C source AND the old signed app in a new forward
+  revert commit for the normal updater. Do not rely on uninstall alone or the
+  transient old_openpilot staging directory. Firmware recovery can still require
+  separate intervention if startup/flashing fails.
+- Maintenance: replay source onto a newer upstream release, then rebuild and
+  retest firmware from that release. Never blindly carry this old compiled app
+  onto new upstream source/host binaries. Recheck flag collisions, native Tesla
+  encoding changes, host packet hashes, signing/bootstub compatibility, and
+  independent inhibit/freshness/reset behavior. Retain the prior signed image
+  and rollback path for every firmware release.
+- Commit subject: `feat: pause Tesla steering at highest hands-on level`.
+- Files: Tesla values/interface/CarState/CarController under
+  `opendbc_repo/opendbc/car/tesla`, `opendbc_repo/opendbc/safety/modes/tesla.h`,
+  `sunnypilot/selfdrive/controls/controlsd_ext.py`, the hands-on monitor and pause
+  helper, their focused tests, the signed H7 application, this register, and
+  `docs/firmware/tesla-005`. Test-only harness fixes in safety `common.py` and
+  `libsafety_py.py` restore existing full-suite discovery and actual non-debug
+  release compilation; no safety test files were excluded.
+- Validation: 184 Python tests and 26 subtests passed; complete native safety
+  suite passed with 8,384 tests run and 902 abstract/not-applicable skips. The
+  original base with the same repaired harness passed 8,332 tests, 901 skipped.
+  Tesla C coverage is 186/186 lines (100%). The overall 100% line gate still
+  fails on one unchanged Hyundai release-only line, on both baseline and current
+  source (2,471/2,472 and 2,480/2,481 respectively); it is not claimed as passing.
+  Pinned Cppcheck 2.16.0/MISRA checks pass for baseline and current source, and
+  the generated MISRA coverage table matches the repository. Ruff on all changed
+  Python and Git whitespace checks passed. Independent review added MADS/brake
+  and vehicle-bus regressions; no confirmed code blocker remains.
+- Final H7 app: 98,420 bytes, SHA256
+  `bce76f09637897b807000aeae308dc87137687f9d35721f3091dfdd4a43a25df`.
+  Verified its body against the rebuilt unsigned image, debug RSA signature,
+  VERS format 2, unchanged packet hashes, and unchanged original bootstub. The
+  build uses ARM GCC 14.2.1 and differs from upstream's original toolchain; the
+  baseline rebuild is not byte-identical to the shipped image. Details and final
+  source hashes are in the build record. Tests/builds used isolated non-root
+  containers with read-only host inputs, masked metadata and no runtime network.
+- Limits: no route replay, Panda hardware-in-the-loop, device flash/rollback, or
+  vehicle validation. The actual cause of the user's original hard-turn exit
+  remains unconfirmed without logs. High-angle-rate faults can still cancel
+  during sharp turns. Retained ACC can retain unwanted acceleration during an
+  override; low steering resistance and parking tests do not establish road or
+  emergency-maneuver safety. Recovering from a failed flash may need intervention.
 
 ### INVESTIGATION-001 - Tesla Autopark cancellation (no runtime change)
 
@@ -713,3 +814,9 @@ on hardware; its source and prebuilt binaries are unchanged.
   delivery and rollback. Recommended identifying the trigger and preserving real
   EPS fault disengagement before considering a narrower force-override policy.
   Assessment/documentation only; published driving code and firmware unchanged.
+- 2026-09-27: implemented the subsequently authorized TESLA-005 level-3 steering
+  pause, preserving high-angle-rate fault full disengagement and independent
+  steering inhibition. Added the matching signed H7 application, full build/test
+  provenance and a pre-change backup branch. Kept the same upstream base and
+  installer alias for delivery through the normal `release-mici` updater. Device
+  flashing, behavior and rollback remain unverified on hardware.

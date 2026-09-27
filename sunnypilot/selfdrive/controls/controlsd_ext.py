@@ -92,11 +92,14 @@ class ControlsExt(ModelStateBase):
     hands_on_zero_since = None
     if self.tesla_hands_on is not None:
       hands_on_zero_since = self.tesla_hands_on.update(messaging.drain_sock_raw(self.tesla_can_sock), time.monotonic_ns())
+    hands_on_level = self.tesla_hands_on.hands_on_level if self.tesla_hands_on is not None else None
     # Use the live planner target, NOT the actuator output/current curvature that
     # deliberately tracks the measured wheel angle while lateral control is off.
     target_angle = math.degrees(self.VM.get_steer_from_curvature(-planned_curvature, CS.vEgo, lp.roll)) + lp.angleOffsetDeg
     plan_service = 'lateralManeuverPlan' if sm.valid['lateralManeuverPlan'] else 'modelV2'
     valid = sm.all_checks(['carState', 'liveParameters', plan_service]) and math.isfinite(CS.vEgoRaw)
+    # Missing CAN evidence cannot clear an EPS override or establish re-entry.
+    valid = valid and (self.tesla_hands_on is None or hands_on_level is not None)
     paused_before = self.tesla_steering_pause.paused
     hard_disengaged_before = self.tesla_steering_pause.hard_disengaged
     reason_before = self.tesla_steering_pause.reason
@@ -118,6 +121,7 @@ class ControlsExt(ModelStateBase):
       CS, requested_active=self.get_lat_requested(sm), target_angle=target_angle,
       sample_time=sm.logMonoTime['carState'] * 1e-9, valid=valid, resume_allowed=resume_allowed,
       hands_on_zero_since=hands_on_zero_since,
+      driver_override=hands_on_level == 3,
     )
     sample_time = sm.logMonoTime['carState'] * 1e-9
     log_paused = self.tesla_steering_pause.paused and (self.tesla_pause_log_time is None or sample_time - self.tesla_pause_log_time >= 1.0)
@@ -129,6 +133,7 @@ class ControlsExt(ModelStateBase):
       cloudlog.event("tesla_steering_pause", paused=self.tesla_steering_pause.paused,
                      reason=self.tesla_steering_pause.reason,
                      eps_reports_released=hands_on_zero_since is not None,
+                     eps_hands_on_level=hands_on_level,
                      resume_allowed=resume_allowed,
                      wheel_rate_deg_s=CS.steeringRateDeg if math.isfinite(CS.steeringRateDeg) else None,
                      torque_nm=CS.steeringTorque if math.isfinite(CS.steeringTorque) else None,

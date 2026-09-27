@@ -250,6 +250,37 @@ class TestTeslaSteeringPauseIntegration:
     CC, _ = self.state_control_step()
     assert CC.longActive and not CC.latActive
 
+  def test_actual_controller_pauses_on_level_three_without_cancelling_speed(self):
+    controls = self.actual_controls()
+    self.enable_can_hands_monitor()
+    self.CS.steeringAngleDeg = 0.0
+    self.CS.steeringTorque = 4.0
+    self.CS.steeringRateDeg = 90.0
+    self.hands_level = 3
+    for _ in range(200):
+      CC, lateral_log = self.state_control_step()
+      assert CC.enabled and CC.longActive and not CC.latActive
+      assert not CC.cruiseControl.cancel
+      assert not lateral_log.active
+      assert not controls.tesla_steering_pause.hard_disengaged
+    assert controls.tesla_steering_pause.reason == "eps_driver_override"
+    self.hands_level = 2
+    CC, lateral_log = self.state_control_step()
+    assert CC.enabled and CC.longActive and CC.latActive and lateral_log.active
+
+  def test_missing_epas_after_level_three_cannot_enable_aligned_steering(self):
+    self.actual_controls()
+    self.enable_can_hands_monitor()
+    self.CS.steeringAngleDeg = 0.0
+    self.hands_level = 3
+    CC, _ = self.state_control_step()
+    assert CC.longActive and not CC.latActive
+    self.mocker.patch("openpilot.sunnypilot.selfdrive.controls.controlsd_ext.messaging.drain_sock_raw", return_value=[])
+    for _ in range(30):
+      CC, _ = self.state_control_step()
+      assert CC.longActive and not CC.latActive
+    assert self.controls.tesla_steering_pause.reason == "unavailable"
+
   def test_aligned_recovery_still_requires_fresh_actuator_output(self):
     self.CS.steeringTorque = 2.0
     assert not self.step()

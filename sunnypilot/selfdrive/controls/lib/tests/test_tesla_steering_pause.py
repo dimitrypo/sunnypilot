@@ -13,6 +13,7 @@ class TestTeslaSteeringPause:
     self.now = 10.0
     self.target = 0.0
     self.zero_since = None
+    self.driver_override = False
 
   def step(self, *, torque=None, rate=None, angle=None, dt=0.01, active=True, valid=True, resume_allowed=True):
     for key, value in (("steeringTorque", torque), ("steeringRateDeg", rate), ("steeringAngleDeg", angle)):
@@ -20,7 +21,7 @@ class TestTeslaSteeringPause:
         setattr(self.CS, key, value)
     self.now += dt
     return self.pause.update(self.CS, requested_active=active, target_angle=self.target, sample_time=self.now, valid=valid,
-                             resume_allowed=resume_allowed, hands_on_zero_since=self.zero_since)
+                             resume_allowed=resume_allowed, hands_on_zero_since=self.zero_since, driver_override=self.driver_override)
 
   def enter_pause(self):
     assert not self.step(torque=1.5)
@@ -107,6 +108,36 @@ class TestTeslaSteeringPause:
     self.CS.steeringDisengage = True
     for _ in range(100):
       assert not self.step(torque=2.0, angle=0, rate=90)
+
+  def test_eps_level_three_beats_alignment_without_latching_disengagement(self):
+    assert self.step(torque=4, angle=0, rate=90)
+    self.driver_override = True
+    assert not self.step(dt=0)  # New EPAS can arrive ahead of the next carState.
+    for _ in range(200):
+      assert not self.step()
+      assert not self.pause.hard_disengaged
+      assert self.pause.reason == "eps_driver_override"
+    self.driver_override = False
+    assert not self.step(dt=0)  # Clearing EPAS alone cannot make stale CS fresh.
+    assert self.step()
+
+  def test_release_after_eps_override_uses_existing_point_two_timer(self):
+    self.driver_override = True
+    for _ in range(100):
+      assert not self.step(torque=0.0, angle=2)
+    self.driver_override = False
+    self.assert_recovers_after(0.2)
+
+  def test_high_angle_fault_during_eps_override_keeps_hard_latch(self):
+    self.driver_override = True
+    assert not self.step(angle=0)
+    self.CS.steeringDisengage = True
+    assert not self.step()
+    self.driver_override = False
+    self.CS.steeringDisengage = False
+    for _ in range(100):
+      assert not self.step()
+    assert self.pause.hard_disengaged
 
   def test_eps_release_recovers_despite_residual_torque_and_motion(self):
     self.enter_pause()

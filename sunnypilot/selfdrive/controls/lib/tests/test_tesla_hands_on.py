@@ -137,3 +137,21 @@ class TestTeslaHandsOnMonitor:
     event = log.Event.new_message(valid=True, logMonoTime=self.now)
     event.init("carState")
     assert self.monitor.update([event.to_bytes()], self.now) is None
+
+  @pytest.mark.parametrize("level", [0, 1, 2, 3])
+  def test_publishes_only_fresh_valid_level(self, level):
+    assert self.monitor.hands_on_level is None
+    self.step(level)
+    assert self.monitor.hands_on_level == level
+    self.monitor.update([], self.now + 100_000_001)
+    assert self.monitor.hands_on_level is None
+
+  def test_invalid_or_wrong_bus_cannot_clear_highest_level(self):
+    self.step(3)
+    assert self.monitor.hands_on_level == 3
+    self.step(0, bus=CANBUS.autopilot_party)
+    assert self.monitor.hands_on_level == 3
+    self.step(0, valid=False)
+    assert self.monitor.hands_on_level is None
+    self.step(2)
+    assert self.monitor.hands_on_level == 2

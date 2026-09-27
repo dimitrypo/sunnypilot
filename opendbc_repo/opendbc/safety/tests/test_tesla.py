@@ -221,7 +221,8 @@ class TestTeslaSafetyBase(common.CarSafetyTest, common.AngleSteeringSafetyTest, 
         for eac_error_code in range(16):
           self.safety.set_controls_allowed(True)
 
-          should_disengage = hands_on_level >= 3 or (eac_status == 0 and eac_error_code == 9)
+          pause_enabled = bool(self.SAFETY_PARAM & TeslaSafetyFlags.STEERING_PAUSE)
+          should_disengage = (hands_on_level >= 3 and not pause_enabled) or (eac_status == 0 and eac_error_code == 9)
           self.assertTrue(self._rx(self._angle_meas_msg(0, hands_on_level=hands_on_level, eac_status=eac_status,
                                                         eac_error_code=eac_error_code)))
           self.assertNotEqual(should_disengage, self.safety.get_controls_allowed())
@@ -457,6 +458,194 @@ class TestTeslaLongitudinalSafety(TestTeslaSafetyBase):
 
 class TestTeslaFSD14LongitudinalSafety(TestTeslaLongitudinalSafety):
   SAFETY_PARAM = TeslaSafetyFlags.LONG_CONTROL | TeslaSafetyFlags.FSD_14
+
+
+class TeslaSteeringPauseSafety(unittest.TestCase):
+  # Reuse the real CAN message builders and libsafety fixture, without inheriting
+  # angle-only tests that advance time with no accompanying 100 Hz EPAS traffic.
+  # The unchanged legacy variants above continue to run that full common suite.
+  SAFETY_PARAM = 0
+
+  def __getattr__(self, name):
+    if "driver" in self.__dict__:
+      return getattr(self.driver, name)
+    raise AttributeError(name)
+
+  @classmethod
+  def setUpClass(cls):
+    if cls is TeslaSteeringPauseSafety:
+      raise unittest.SkipTest("Fixture only")
+
+  def setUp(self):
+    self.driver = TestTeslaSafetyBase()
+    self.driver.SAFETY_PARAM = self.SAFETY_PARAM
+    TestTeslaSafetyBase.cnt_angle_cmd = 0
+    self.driver.setUp()
+    # The pause policy starts inhibited until its first valid EPAS sample.
+    self._rx(self._angle_meas_msg(0))
+
+  def test_level_three_retains_engagement_but_inhibits_all_active_steering_modes(self):
+    self._rx(self._pcm_status_msg(True))
+    self.assertTrue(self._rx(self._angle_meas_msg(0, hands_on_level=3)))
+    for _ in range(10):
+      self._rx(self._angle_meas_msg(0, hands_on_level=3))
+      self.assertTrue(self.safety.get_controls_allowed())
+      self.assertFalse(self.safety.get_steering_disengage_prev())
+      for mode in (1, 2):
+        previous_angle = self.safety.get_desired_angle_last()
+        self.assertFalse(self._tx(self._angle_cmd_msg(0.1, mode)))
+        self.assertEqual(previous_angle, self.safety.get_desired_angle_last())
+      self.assertTrue(self._tx(self._angle_cmd_msg(0, 0)))
+      # Cancellation remains possible with either stock or openpilot ACC.
+      self.assertTrue(self._tx(self._long_control_msg(10, acc_state=self.acc_states["ACC_CANCEL_GENERIC_SILENT"])))
+      if self.SAFETY_PARAM & TeslaSafetyFlags.LONG_CONTROL:
+        self.assertTrue(self._tx(self._long_control_msg(10, acc_state=self.acc_states["ACC_ON"], accel_limits=(0, 0.5))))
+
+    self.assertTrue(self._rx(self._angle_meas_msg(0, hands_on_level=2)))
+    self.assertTrue(self.safety.get_controls_allowed())
+    self.assertTrue(self._tx(self._angle_cmd_msg(0, 1)))
+    self.assertTrue(self._tx(self._angle_cmd_msg(0, 2)))
+
+  def test_pause_tracks_measured_angle_with_existing_inactive_limits(self):
+    self._rx(self._pcm_status_msg(True))
+    for _ in range(6):
+      self._rx(self._angle_meas_msg(30, hands_on_level=3))
+    self.assertTrue(self._tx(self._angle_cmd_msg(30, 0)))
+    self.assertFalse(self._tx(self._angle_cmd_msg(0, 0)))
+    self.assertFalse(self._tx(self._angle_cmd_msg(30, 1)))
+    self.assertFalse(self._tx(self._angle_cmd_msg(30, 2)))
+
+  def test_high_angle_fault_during_override_still_fully_disengages(self):
+    self._rx(self._pcm_status_msg(True))
+    self._rx(self._angle_meas_msg(0, hands_on_level=3))
+    self._rx(self._angle_meas_msg(0, hands_on_level=3, eac_status=0, eac_error_code=9))
+    self.assertFalse(self.safety.get_controls_allowed())
+    self.assertTrue(self.safety.get_steering_disengage_prev())
+    self._rx(self._angle_meas_msg(0))
+    self.assertFalse(self.safety.get_controls_allowed())
+    self.assertFalse(self._tx(self._angle_cmd_msg(0, 1)))
+    if self.SAFETY_PARAM & TeslaSafetyFlags.LONG_CONTROL:
+      self.assertFalse(self._tx(self._long_control_msg(10, accel_limits=(0, 0.5))))
+
+  def test_brake_during_override_still_cancels_and_release_cannot_reengage(self):
+    self._rx(self._pcm_status_msg(True))
+    self._rx(self._angle_meas_msg(0, hands_on_level=3))
+    self._rx(self._user_brake_msg(True))
+    self.assertFalse(self.safety.get_controls_allowed())
+    self._rx(self._user_brake_msg(False))
+    self._rx(self._angle_meas_msg(0))
+    self.assertFalse(self.safety.get_controls_allowed())
+
+  def test_level_three_with_mads_active_still_exits_on_brake(self):
+    self.safety.set_mads_params(True, True, False)
+    self._rx(self._pcm_status_msg(True))
+    self.safety.set_controls_allowed_lateral(True)
+    self._rx(self._angle_meas_msg(0, hands_on_level=3))
+    self.assertTrue(self.safety.get_controls_allowed())
+    self.assertTrue(self.safety.get_controls_allowed_lateral())
+    self.assertFalse(self._tx(self._angle_cmd_msg(0, 1)))
+    self._rx(self._user_brake_msg(True))
+    self.assertFalse(self.safety.get_controls_allowed())
+    self.assertFalse(self.safety.get_controls_allowed_lateral())
+    self._rx(self._user_brake_msg(False))
+    self._rx(self._angle_meas_msg(0))
+    self.assertFalse(self.safety.get_controls_allowed())
+    self.assertFalse(self.safety.get_controls_allowed_lateral())
+
+  def test_invalid_epas_cannot_clear_override(self):
+    self._rx(self._pcm_status_msg(True))
+    self._rx(self._angle_meas_msg(0, hands_on_level=3))
+    msg = self._angle_meas_msg(0)
+    msg.data[7] ^= 0xFF
+    self.assertFalse(self._rx(msg))
+    # Simulate stale/misbehaving host still requesting enabled steering.
+    self.safety.set_controls_allowed(True)
+    self.assertFalse(self._tx(self._angle_cmd_msg(0, 1)))
+    self.assertFalse(self._tx(self._angle_cmd_msg(0, 2)))
+
+  def test_reinitialization_requires_new_epas_evidence(self):
+    self._rx(self._pcm_status_msg(True))
+    self.safety.set_safety_hooks(CarParams.SafetyModel.tesla, self.SAFETY_PARAM)
+    self._rx(self._pcm_status_msg(True))
+    self.assertFalse(self._tx(self._angle_cmd_msg(0, 1)))
+    self._rx(self._angle_meas_msg(0))
+    self.assertTrue(self._tx(self._angle_cmd_msg(0, 1)))
+
+  def test_switching_to_unflagged_policy_restores_force_disengagement(self):
+    self.safety.set_safety_hooks(CarParams.SafetyModel.tesla, self.SAFETY_PARAM & ~TeslaSafetyFlags.STEERING_PAUSE)
+    self._rx(self._pcm_status_msg(True))
+    self._rx(self._angle_meas_msg(0, hands_on_level=3))
+    self.assertFalse(self.safety.get_controls_allowed())
+
+  def test_vehicle_bus_config_retains_override_pause_and_fault_cutoff(self):
+    self.safety.set_current_safety_param_sp(TeslaSafetyFlagsSP.HAS_VEHICLE_BUS)
+    self.safety.set_safety_hooks(CarParams.SafetyModel.tesla, self.SAFETY_PARAM)
+    self.assertEqual(self.safety.get_current_safety_param_sp(), TeslaSafetyFlagsSP.HAS_VEHICLE_BUS)
+    self._rx(self._pcm_status_msg(True))
+    self._rx(self._angle_meas_msg(0, hands_on_level=3))
+    self.assertTrue(self.safety.get_controls_allowed())
+    self.assertFalse(self.safety.get_steering_disengage_prev())
+    self.assertFalse(self._tx(self._angle_cmd_msg(0, 1)))
+    self.assertTrue(self._tx(self._angle_cmd_msg(0, 0)))
+    self._rx(self._angle_meas_msg(0, hands_on_level=3, eac_status=0, eac_error_code=9))
+    self.assertFalse(self.safety.get_controls_allowed())
+    self.assertTrue(self.safety.get_steering_disengage_prev())
+
+  def test_all_hands_levels_and_eps_fault_codes(self):
+    self.driver.test_steering_wheel_disengage()
+
+  def test_stale_epas_blocks_steering_even_with_mads_active(self):
+    self._rx(self._pcm_status_msg(True))
+    self.safety.set_controls_allowed_lateral(True)
+    self.safety.set_timer(100000)
+    self.assertTrue(self._tx(self._angle_cmd_msg(0, 1, increment_timer=False)))
+    self.safety.set_timer(100001)
+    self.assertFalse(self._tx(self._angle_cmd_msg(0, 1, increment_timer=False)))
+    self.assertFalse(self._tx(self._angle_cmd_msg(0, 2, increment_timer=False)))
+    self.assertTrue(self._tx(self._angle_cmd_msg(0, 0, increment_timer=False)))
+    self.assertTrue(self.safety.get_controls_allowed())
+    self.assertTrue(self.safety.get_controls_allowed_lateral())
+    self._rx(self._angle_meas_msg(0))
+    self.assertTrue(self._tx(self._angle_cmd_msg(0, 1, increment_timer=False)))
+
+  def test_freshness_handles_microsecond_timer_wrap(self):
+    self._rx(self._pcm_status_msg(True))
+    self.safety.set_timer(0xFFFFFFFF - 50000)
+    self._rx(self._angle_meas_msg(0))
+    self.safety.set_timer(49999)
+    self.assertTrue(self._tx(self._angle_cmd_msg(0, 1, increment_timer=False)))
+    self.safety.set_timer(50000)
+    self.assertFalse(self._tx(self._angle_cmd_msg(0, 1, increment_timer=False)))
+
+  def test_existing_angle_and_acceleration_limits_still_apply(self):
+    self._rx(self._pcm_status_msg(True))
+    for _ in range(6):
+      self._rx(self._speed_msg(30))
+      self._rx(self._speed_msg_2(30))
+      self._rx(self._angle_meas_msg(0))
+    self.assertTrue(self._tx(self._angle_cmd_msg(0, 1)))
+    self.assertFalse(self._tx(self._angle_cmd_msg(100, 1)))
+    self.assertFalse(self._tx(self._angle_cmd_msg(100, 2)))
+    self.assertTrue(self._tx(self._angle_cmd_msg(0, 0)))
+    if self.SAFETY_PARAM & TeslaSafetyFlags.LONG_CONTROL:
+      for accel in (-4.0, 2.1):
+        self.assertFalse(self._tx(self._long_control_msg(10, accel_limits=(min(0, accel), max(0, accel)))))
+
+
+class TestTeslaPauseStockSafety(TeslaSteeringPauseSafety):
+  SAFETY_PARAM = TeslaSafetyFlags.STEERING_PAUSE
+
+
+class TestTeslaPauseFSD14StockSafety(TeslaSteeringPauseSafety):
+  SAFETY_PARAM = TeslaSafetyFlags.STEERING_PAUSE | TeslaSafetyFlags.FSD_14
+
+
+class TestTeslaPauseLongitudinalSafety(TeslaSteeringPauseSafety):
+  SAFETY_PARAM = TeslaSafetyFlags.STEERING_PAUSE | TeslaSafetyFlags.LONG_CONTROL
+
+
+class TestTeslaPauseFSD14LongitudinalSafety(TeslaSteeringPauseSafety):
+  SAFETY_PARAM = TeslaSafetyFlags.STEERING_PAUSE | TeslaSafetyFlags.LONG_CONTROL | TeslaSafetyFlags.FSD_14
 
 
 class TestTeslaIgnition(unittest.TestCase):

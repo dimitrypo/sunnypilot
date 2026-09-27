@@ -129,12 +129,14 @@ class CarControllerParams:
 class TeslaSafetyFlags(IntFlag):
   LONG_CONTROL = 1
   FSD_14 = 2
+  STEERING_PAUSE = 8  # Personal Model 3: highest hands-on level inhibits steering without full disengagement.
 
 
 class TeslaFlags(IntFlag):
   LONG_CONTROL = 1
   FSD_14 = 2
   MISSING_DAS_SETTINGS = 4
+  STEERING_PAUSE = 8
 
 
 DBC = CAR.create_dbc_map()

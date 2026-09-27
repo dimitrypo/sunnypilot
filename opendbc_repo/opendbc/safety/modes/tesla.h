@@ -19,6 +19,9 @@
 static bool tesla_longitudinal = false;
 static bool tesla_fsd_14 = false;
 static bool tesla_stock_aeb = false;
+static bool tesla_steering_pause = false;
+static bool tesla_driver_override = true;
+static uint32_t tesla_epas_timestamp = 0;
 
 // Only rising edges while controls are not allowed are considered for these systems:
 // TODO: Only LKAS (non-emergency) is currently supported since we've only seen it
@@ -137,8 +140,11 @@ static void tesla_rx_hook(const CANPacket_t *msg) {
       const int eac_status = msg->data[6] >> 5;  // EPAS3S_eacStatus
       const int eac_error_code = msg->data[2] >> 4;  // EPAS3S_eacErrorCode
 
-      // Disengage on normal user override, or if high angle rate fault from user overriding extremely quickly
-      steering_disengage = (hands_on_level >= 3) || ((eac_status == 0) && (eac_error_code == 9));
+      // The personal pause policy inhibits steering independently of the host,
+      // while preserving longitudinal permission. EPS safety faults still exit.
+      tesla_driver_override = hands_on_level >= 3;
+      tesla_epas_timestamp = microsecond_timer_get();
+      steering_disengage = (!tesla_steering_pause && tesla_driver_override) || ((eac_status == 0) && (eac_error_code == 9));
     }
 
     // Vehicle speed (DI_speed)
@@ -269,8 +275,15 @@ static bool tesla_tx_hook(const CANPacket_t *msg) {
     bool steer_control_enabled = (steer_control_type == angle_ctrl_type) ||  // ANGLE_CONTROL
                                  (steer_control_type == lkas_ctrl_type);     // LANE_KEEP_ASSIST
 
-    if (steer_angle_cmd_checks_vm(desired_angle, steer_control_enabled, TESLA_STEERING_LIMITS, TESLA_STEERING_PARAMS)) {
+    const bool epas_stale = safety_get_ts_elapsed(microsecond_timer_get(), tesla_epas_timestamp) > 100000U;
+    if (tesla_steering_pause && (tesla_driver_override || epas_stale) && steer_control_enabled) {
+      // Do not advance accepted angle history for a rejected enabled command.
+      // Inactive commands still track measured angle through the usual checks.
       violation = true;
+    } else if (steer_angle_cmd_checks_vm(desired_angle, steer_control_enabled, TESLA_STEERING_LIMITS, TESLA_STEERING_PARAMS)) {
+      violation = true;
+    } else {
+      // Angle checks passed; preserve any other reason to reject this command.
     }
 
     bool valid_steer_control_type = (steer_control_type == 0) ||                // NONE
@@ -373,6 +386,11 @@ static safety_config tesla_init(uint16_t param) {
 
   const uint16_t TESLA_FLAG_FSD_14 = 2;
   tesla_fsd_14 = GET_FLAG(param, TESLA_FLAG_FSD_14);
+  const uint16_t TESLA_FLAG_STEERING_PAUSE = 8;
+  tesla_steering_pause = GET_FLAG(param, TESLA_FLAG_STEERING_PAUSE);
+  // Require a valid EPAS sample before permitting steering in the pause policy.
+  tesla_driver_override = true;
+  tesla_epas_timestamp = 0;
 
 #ifdef ALLOW_DEBUG
   const uint16_t TESLA_FLAG_LONGITUDINAL_CONTROL = 1;

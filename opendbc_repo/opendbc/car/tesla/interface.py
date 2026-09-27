@@ -60,6 +60,10 @@ class CarInterface(CarInterfaceBase):
       ret.safetyConfigs[0].safetyParam |= TeslaSafetyFlags.FSD_14.value
 
     if candidate == CAR.TESLA_MODEL_3:
+      # This policy requires the matching Panda firmware. Keep the car-side and
+      # safety flags paired; other Tesla platforms retain full force override.
+      ret.flags |= TeslaFlags.STEERING_PAUSE.value
+      ret.safetyConfigs[0].safetyParam |= TeslaSafetyFlags.STEERING_PAUSE.value
       carlog.info({
         "event": "tesla_steering_protocol",
         "fingerprint": candidate,
@@ -67,6 +71,7 @@ class CarInterface(CarInterfaceBase):
         "redundant_braking_on_bus_2": redundant_braking_seen,
         "autonomy_health_on_bus_0": autonomy_health_seen,
         "legacy_fsd14_encoding_flag": bool(ret.flags & TeslaFlags.FSD_14.value),
+        "steering_pause_policy": bool(ret.flags & TeslaFlags.STEERING_PAUSE.value),
       })
 
     ret.dashcamOnly = candidate in (CAR.TESLA_MODEL_X,)  # dashcam only, pending find invalidLkasSetting signal

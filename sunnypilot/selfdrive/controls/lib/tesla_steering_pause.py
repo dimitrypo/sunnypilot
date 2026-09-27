@@ -31,13 +31,14 @@ class TeslaSteeringPause:
     self.reason = "inactive"
 
   def update(self, CS, *, requested_active: bool, target_angle: float, sample_time: float, valid: bool, resume_allowed: bool,
-             hands_on_zero_since: float | None = None) -> bool:
+             hands_on_zero_since: float | None = None, driver_override: bool = False) -> bool:
     """Return lateral permission only; never set engagement, cruise, or driver contact.
 
     sample_time comes from the carState message timestamp, so duplicate/stale
     samples cannot advance timers. requested_active excludes our own pause latch.
     hands_on_zero_since is supplied only by the fresh, read-only CAN monitor;
     it identifies the current uninterrupted EPS no-holding interval.
+    driver_override is the fresh EPS level-3 inhibit, not a full disengagement.
     """
     if not requested_active:
       self.reset()
@@ -58,6 +59,16 @@ class TeslaSteeringPause:
       self.entry_since = self.quiet_since = self.condition = None
       self.last_sample_time = None
       self.reason = "unavailable"
+      return False
+
+    # Mirror the independent CarController/Panda inhibit. Even alignment cannot
+    # request steering at EPS level 3; lowering the level permits normal recovery.
+    if driver_override:
+      self.paused = True
+      self.entry_since = self.quiet_since = self.condition = None
+      if self.last_sample_time is None or sample_time > self.last_sample_time:
+        self.last_sample_time = sample_time
+      self.reason = "eps_driver_override"
       return False
 
     if self.last_sample_time is not None:

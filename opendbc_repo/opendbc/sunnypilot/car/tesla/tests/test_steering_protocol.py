@@ -105,6 +105,7 @@ class TestPersonalSteeringProtocol(unittest.TestCase):
       "redundant_braking_on_bus_2": False,
       "autonomy_health_on_bus_0": True,
       "legacy_fsd14_encoding_flag": True,
+      "steering_pause_policy": True,
     })
 
 
